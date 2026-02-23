@@ -8,6 +8,8 @@ import time
 import importlib.util
 import os
 import json
+import zipfile
+import tempfile
 
 try:
     import ctypes
@@ -35,11 +37,14 @@ BACKGROUND_COLOR = (5, 5, 10)
 ACTIVE_COLOR     = (255, 60, 60)
 BAR_SPACING      = 1
 
+# Change this in your USER SETTINGS section
+SOUND_SUSTAIN = 3.9  # This will now act as a resonance factor
+
 ENABLE_SOUND  = True
-FREQ_LOW      = 120.0
-FREQ_HIGH     = 1212.0
+FREQ_LOW      = 24.0
+FREQ_HIGH     = 480.0
 FREQ_ABS_LOW  = 12.0
-FREQ_ABS_HIGH = 4800.0
+FREQ_ABS_HIGH = 480.0
 FREQ_SNAP     = 12          # slider snaps to multiples of this
 SOUND_SUSTAIN = 0.10
 SAMPLE_RATE   = 44100
@@ -213,6 +218,7 @@ def value_to_color(value, max_value):
     if r < 0.5:  return (0, 255, int(255 * (1 - (r - 0.25) * 4)))
     if r < 0.75: return (int(255 * (r - 0.5) * 4), 255, 0)
     return (255, int(255 * (1 - (r - 0.75) * 4)), 0)
+
 
 def draw_bars(screen, array, active_indices, label=""):
     screen.fill(BACKGROUND_COLOR)
@@ -448,10 +454,16 @@ def load_custom_sorter(filepath: str):
 
 def open_file_dialog():
     if not HAS_TK: return None
-    root = tk.Tk(); root.withdraw(); root.attributes("-topmost", True)
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
     path = filedialog.askopenfilename(
-        title="Load Custom Sorter",
-        filetypes=[("Python files", "*.py"), ("All files", "*.*")]
+        title="Load Custom Sorter / SortPack",
+        filetypes=[
+            ("Python files", "*.py"),
+            ("SortPack ZIP files", "*.zip"),
+            ("All files", "*.*")
+        ]
     )
     root.destroy()
     return path if path else None
@@ -466,6 +478,43 @@ def autoload_custom_sorters():
                 name, key = result
                 if not any(k == key for _, k in ALGORITHMS):
                     ALGORITHMS.append((name, key))
+
+def load_sortpack(zip_path):
+    """
+    Load a .zip SortPack containing multiple custom sorter .py files,
+    including those inside nested folders.
+    Returns list of (name, key) for successfully loaded sorters.
+    """
+    loaded = []
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            # Extract everything
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                zf.extractall(tmpdir)
+
+            # Walk recursively
+            for root, dirs, files in os.walk(tmpdir):
+                for fname in files:
+                    if fname.endswith(".py"):
+                        fpath = os.path.join(root, fname)
+                        result, err = load_custom_sorter(fpath)
+                        if result:
+                            name, key = result
+                            loaded.append((name, key))
+    except Exception as e:
+        print(f"SortPack load error: {e}")
+
+    return loaded
+
+# Roaming folder path
+if sys.platform == "win32":
+    APPDATA = os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
+    SORTPACK_DIR = os.path.join(APPDATA, "SuperSorter", "SortPacks")
+else:
+    SORTPACK_DIR = os.path.expanduser("~/.supersorter/sortpacks")
+
+# Make sure it exists
+os.makedirs(SORTPACK_DIR, exist_ok=True)
 
 # ============================================================
 # ========================= LAYOUT CONSTANTS =================
@@ -741,17 +790,55 @@ class Menu:
     def _do_load(self):
         path = open_file_dialog()
         if not path: return
-        result, err = load_custom_sorter(path)
-        if err:
-            self._notify(f"Error: {err[:55]}", ok=False)
-            return
-        name, key = result
-        if not any(k == key for _, k in ALGORITHMS):
-            ALGORITHMS.append((name, key))
-        _save_autoload_json()          # persist to JSON for next launch
-        self._build_btns()
-        self.sel = len(ALGORITHMS) - 1
-        self._notify(f"Loaded: {name}", ok=True)
+
+        # Handle Python sorter
+        if path.lower().endswith(".py"):
+            result, err = load_custom_sorter(path)
+            if err:
+                self._notify(f"Error: {err[:55]}", ok=False)
+                return
+            name, key = result
+            if not any(k == key for _, k in ALGORITHMS):
+                ALGORITHMS.append((name, key))
+            _save_autoload_json()
+            self._build_btns()
+            self.sel = len(ALGORITHMS) - 1
+            self._notify(f"Loaded: {name}", ok=True)
+
+        # Handle SortPack ZIP
+        elif path.lower().endswith(".zip"):
+            try:
+                with zipfile.ZipFile(path, "r") as z:
+                    # Look for a markdown file for SortPack metadata
+                    md_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
+                    sortpack_name = os.path.splitext(os.path.basename(path))[0]
+                    if md_files:
+                        md_content = z.read(md_files[0]).decode("utf-8")
+                        # Example: first line could be the SortPack name
+                        first_line = md_content.strip().splitlines()[0]
+                        if first_line:
+                            sortpack_name = first_line.strip()
+
+                    # Extract all .py files to a temp folder
+                    temp_dir = os.path.join(_SCRIPT_DIR, "__sortpack_temp__")
+                    os.makedirs(temp_dir, exist_ok=True)
+                    py_files = [f for f in z.namelist() if f.lower().endswith(".py")]
+                    for f in py_files:
+                        z.extract(f, temp_dir)
+                        full_path = os.path.join(temp_dir, f)
+                        result, err = load_custom_sorter(full_path)
+                        if result:
+                            name, key = result
+                            if not any(k == key for _, k in ALGORITHMS):
+                                ALGORITHMS.append((name, key))
+
+                    _save_autoload_json()
+                    self._build_btns()
+                    self.sel = len(ALGORITHMS) - 1
+                    self._notify(f"Loaded SortPack: {sortpack_name}", ok=True)
+
+            except Exception as e:
+                self._notify(f"Failed to load SortPack: {str(e)[:50]}", ok=False)
 
     def draw(self):
         s  = self.screen
