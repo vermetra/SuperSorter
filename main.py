@@ -45,42 +45,48 @@ FREQ_ABS_HIGH = 480.0
 FREQ_SNAP     = 12
 SAMPLE_RATE   = 44100
 CHUNK_SIZE    = 512
-_last_trigger_time: float = 0.0
-TRIGGER_MIN_INTERVAL = 0.035
 
 # ============================================================
 # ====================== SOUND SETTINGS ======================
 # ============================================================
 #
-# SOUND_SUSTAIN — how long each tone rings out, in seconds.
-#   Higher = longer sustain / more overlap between notes.
-#   Good range: 0.08 (snappy) to 0.25 (lush/washy).
-SOUND_SUSTAIN = 0.18
+# SOUND_SUSTAIN — how long each triggered tone rings out, in seconds.
+#   This is the note's total lifetime from trigger to silence.
+#   Good range: 0.15 (snappy) to 0.40 (lush, washy overlap).
+SOUND_SUSTAIN  = 0.25
 #
-# SOUND_ATTACK — fade-in time in seconds.
-#   A raised-cosine (Hann) window is used instead of a linear ramp,
-#   which eliminates the "click" you get at note onset.
-#   Formula: env[t] = 0.5 * (1 - cos(pi * t / attack_samples))
-SOUND_ATTACK  = 0.012
+# SOUND_ATTACK — fade-in time in seconds using a raised-cosine curve.
+#   Raised-cosine (Hann) means the waveform eases in smoothly rather
+#   than jumping from zero — eliminates the sharp "click" on note onset.
+#   Formula per sample t in [0, A): env = 0.5 * (1 - cos(pi * t / A))
+SOUND_ATTACK   = 0.015
 #
-# SOUND_RELEASE — fade-out time in seconds.
-#   Same raised-cosine shape applied in reverse at note end.
-#   Longer release = smoother, more piano-like tail.
-SOUND_RELEASE = 0.060
+# SOUND_RELEASE — fade-out time in seconds, same raised-cosine shape.
+#   The tail of each note eases out rather than cutting abruptly.
+#   Formula per sample t in [max_age-R, max_age): env = 0.5*(1+cos(pi*(t-rel_start)/R))
+SOUND_RELEASE  = 0.120
 #
-# HARMONIC_BLEND — amount of subtle 2nd harmonic (octave above) mixed in.
-#   0.0 = pure sine (very clean). 0.08 = a touch of warmth without buzz.
-#   The 2nd harmonic is also a sine, so it adds warmth without harshness.
-#   Formula: wave = sin(2pi*f*t) + HARMONIC_BLEND * sin(4pi*f*t)
-HARMONIC_BLEND = 0.08
+# HARMONIC_BLEND — mix of a subtle 2nd harmonic (one octave up) into the sine.
+#   0.0 = pure crystal sine. 0.12 = gentle warmth. 0.25 = noticeably richer.
+#   Both fundamentals and harmonic are pure sines so no harshness is introduced.
+HARMONIC_BLEND  = 0.12
 #
-# MAX_VOICES — maximum simultaneous oscillators before oldest are culled.
-#   Prevents CPU overload when many comparisons fire at once (e.g. bubble sort).
-MAX_VOICES = 24
+# HARMONIC_BLEND_3 — mix of a 3rd harmonic (octave + a fifth up).
+#   This is what adds "crunch" — the same partial that makes organs and
+#   music boxes sound gritty and interesting rather than pure and glassy.
+#   0.0 = off. 0.06 = subtle grit. 0.15 = noticeably crunchy.
+HARMONIC_BLEND_3 = 0.07
 #
-# VOICE_STEAL_FADE — when MAX_VOICES is exceeded, stolen voices get this many
-#   samples to fade to zero before being removed (avoids clicks on cull).
-VOICE_STEAL_FADE = 64
+# MAX_VOICES — hard cap on simultaneous oscillators.
+#   When exceeded the oldest voice is smoothly faded out (voice stealing).
+MAX_VOICES     = 32
+#
+# TRIGGER_RATE_LIMIT — minimum seconds between accepting new note triggers.
+#   This is the key to sustain feeling: without it, the sort loop fires hundreds
+#   of triggers per second, each note barely starting before the next crowds it.
+#   With a gate, notes have breathing room to bloom, sustain, and release.
+#   0.030 = busy and detailed. 0.055 = lush and musical. 0.080 = slow and meditative.
+TRIGGER_RATE_LIMIT = 0.040
 
 # JSON file saved next to the script for autoloading custom sorters
 _SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -149,54 +155,92 @@ def _read_autoload_json() -> list:
 # ====================== SOUND ENGINE ========================
 # ============================================================
 #
-# HOW THE SILKY SINE ENGINE WORKS
-# ================================
+# WHY PYAUDIO INSTEAD OF PYGAME MIXER
+# =====================================
+# pygame.mixer works by queueing discrete Sound objects onto a channel.
+# The OS plays one, then the next queues up — there is always a seam between
+# chunks and the timing of when new oscillators appear is at the mercy of the
+# queue drain speed. This causes the "piercing sharp bursts" feeling: each note
+# starts as a new Sound object with no connection to the previous one.
 #
-# Each note trigger creates an _Osc (oscillator) object.
-# Per chunk, all active oscillators are mixed together into one buffer.
+# PyAudio uses a PULL CALLBACK model instead:
+#   - We open a continuous output stream at 44100 Hz
+#   - The OS audio driver calls our _callback() function whenever it needs
+#     more samples — typically every ~10ms
+#   - We synthesise exactly the samples requested and return them
+#   - There are NO seams, NO queues, NO timing fights — it's one unbroken stream
+#   - New oscillators added between callbacks blend seamlessly into the next chunk
 #
-# WAVEFORM — pure sine + tiny 2nd harmonic (both sines):
-#   phase advances by (freq / sample_rate) each sample.
-#   wave[t] = sin(2pi * phase[t]) + HARMONIC_BLEND * sin(4pi * phase[t])
-#   Using numpy: np.sin(TWO_PI * phases) + HARMONIC_BLEND * np.sin(TWO_PI * 2 * phases)
+# THE OSCILLATOR MODEL
+# =====================
+# Each trigger() call creates one _Osc. Every _Osc has:
+#   freq      — target frequency in Hz (maps from array value)
+#   phase     — current oscillator phase in [0,1), advances by freq/sr each sample
+#   age       — how many samples have been rendered for this voice
+#   max_age   — total lifetime in samples (= SOUND_SUSTAIN * SAMPLE_RATE)
+#   attack    — samples for the fade-in  (= SOUND_ATTACK  * SAMPLE_RATE)
+#   release   — samples for the fade-out (= SOUND_RELEASE * SAMPLE_RATE)
 #
-# ENVELOPE — raised-cosine (Hann) shape for attack and release:
-#   Attack:  env[t] = 0.5 * (1 - cos(pi * t / A))         t in [0, A)
-#   Sustain: env[t] = 1.0                                   t in [A, max_age - R)
-#   Release: env[t] = 0.5 * (1 + cos(pi * (t-start) / R))  t in [max_age-R, max_age)
-#   This is smoother than a linear ramp and eliminates clicking entirely.
+# WAVEFORM
+# =========
+# Pure sine + optional 2nd harmonic (both sines, so no harshness):
+#   phase array: phases[t] = (phase0 + t * freq/sr) mod 1.0
+#   wave[t]    = sin(2pi * phases[t])
+#              + HARMONIC_BLEND * sin(2pi * 2 * phases[t])
 #
-# VOICE STEALING — when MAX_VOICES is exceeded:
-#   The oldest oscillator is flagged for "early release" — its remaining
-#   life is clamped to VOICE_STEAL_FADE samples. The raised-cosine release
-#   still applies, so the stolen note fades cleanly with no click.
+# ENVELOPE — raised-cosine (Hann window) shape
+# =============================================
+# A linear ramp (the old approach) creates an audible click because the
+# waveform's *slope* is discontinuous at the start even if amplitude is zero.
+# Raised-cosine has zero slope at both endpoints — completely click-free.
 #
-# NORMALIZATION — total output is divided by sqrt(n_voices) (RMS-aware),
-#   which keeps perceived loudness roughly constant regardless of how many
-#   voices are playing at once. Pure /n gives too-quiet results with few voices;
-#   sqrt splits the difference perceptually.
+#   Attack  (t in [0, A)):           env = 0.5 * (1 - cos(pi * t / A))
+#   Sustain (t in [A, max-R)):       env = 1.0
+#   Release (t in [max-R, max)):     env = 0.5 * (1 + cos(pi * (t-(max-R)) / R))
+#
+# TRIGGER RATE LIMITING
+# ======================
+# Sort algorithms call trigger_tone() on every comparison/swap — easily
+# hundreds of times per second. Without a gate, no individual note ever gets
+# to develop: the voice pool saturates and everything blurs into noise.
+# TRIGGER_RATE_LIMIT sets the minimum gap between accepted triggers.
+# Notes that arrive too soon are simply dropped. The ones that do fire
+# get their full sustain time uninterrupted.
+#
+# VOICE STEALING
+# ===============
+# If MAX_VOICES is exceeded despite the rate limiter (e.g. slow sort + long
+# sustain), the oldest oscillator has its remaining life clamped to a short
+# cosine fade so it exits cleanly without clicking.
+
+try:
+    import sounddevice as sd
+    HAS_SD = True
+except ImportError:
+    HAS_SD = False
 
 TWO_PI = 2.0 * math.pi
 
 
 class _Osc:
     """
-    Single oscillator voice.
+    A single synthesiser voice.
 
-    Attributes
-    ----------
-    freq      : float  — frequency in Hz
-    phase     : float  — current phase in [0, 1), advances by freq/sr each sample
-    age       : int    — samples rendered so far
-    max_age   : int    — total lifetime in samples
-    attack    : int    — attack length in samples (raised-cosine fade-in)
-    release   : int    — release length in samples (raised-cosine fade-out)
+    phase   : oscillator phase in [0, 1) — advanced by freq/sample_rate each sample
+    age     : samples rendered so far this lifetime
+    max_age : total lifetime in samples
+    attack  : length of raised-cosine fade-in in samples
+    release : length of raised-cosine fade-out in samples
     """
     __slots__ = ('freq', 'phase', 'age', 'max_age', 'attack', 'release')
 
     def __init__(self, freq, max_age, attack, release):
         self.freq    = freq
-        self.phase   = 0.0
+        # Random initial phase in [0,1) prevents phase-discontinuity clicks.
+        # phase=0 always means every new voice snaps the waveform slope at
+        # onset — audible as a tiny pop even with a smooth amplitude envelope.
+        # A random start phase blends the new voice into the stream naturally.
+        self.phase   = random.random()
         self.age     = 0
         self.max_age = max_age
         self.attack  = attack
@@ -204,150 +248,189 @@ class _Osc:
 
 
 class SoundEngine:
+    """
+    Continuous-stream additive sine synthesiser using sounddevice's callback API.
+
+    sounddevice wraps PortAudio and ships it as a binary — no compilation needed.
+    The OS pulls audio from _callback() in real time. We mix all live oscillators
+    into each requested chunk and return it instantly — no buffering, no queuing,
+    no seams between notes.
+
+    Install with:  pip install sounddevice
+    """
+
     def __init__(self):
-        self.sample_rate  = SAMPLE_RATE
-        self.chunk_size   = CHUNK_SIZE
-        self.sustain_smp  = int(SOUND_SUSTAIN  * SAMPLE_RATE)
-        self.attack_smp   = max(1, int(SOUND_ATTACK  * SAMPLE_RATE))
-        self.release_smp  = max(1, int(SOUND_RELEASE * SAMPLE_RATE))
-        self._oscs        = []          # list of active _Osc instances
+        self._sustain_smp = int(SOUND_SUSTAIN * SAMPLE_RATE)
+        self._attack_smp  = max(1, int(SOUND_ATTACK  * SAMPLE_RATE))
+        self._release_smp = max(1, int(SOUND_RELEASE * SAMPLE_RATE))
+        self._oscs        = []      # list[_Osc] — all currently live voices
         self._lock        = threading.Lock()
-        self._running     = False
-        self._thread      = None
-        self._channel     = None
+        self._stream      = None    # sd.OutputStream
+        self._last_t      = 0.0     # wall-clock time of last accepted trigger
 
     def start(self):
-        self._channel = pygame.mixer.Channel(1)
-        self._running = True
-        self._thread  = threading.Thread(target=self._loop, daemon=True)
-        self._thread.start()
+        if not HAS_SD:
+            return
+        # sounddevice.OutputStream with a callback — same pull model as PyAudio
+        # but ships PortAudio as a bundled binary so no compilation is needed.
+        # blocksize=CHUNK_SIZE means the callback fires every ~12ms at 44100 Hz.
+        self._stream = sd.OutputStream(
+            samplerate=SAMPLE_RATE,
+            channels=1,
+            dtype='float32',
+            blocksize=CHUNK_SIZE,
+            callback=self._callback,
+        )
+        self._stream.start()
 
     def stop(self):
-        self._running = False
-        if self._channel:
-            self._channel.stop()
+        if self._stream:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
 
     def trigger(self, value: int, max_value: int):
         """
-        Fire a new note for the given array value.
-        Maps value -> frequency linearly in [FREQ_LOW, FREQ_HIGH].
-        If we're at MAX_VOICES, the oldest voice is voice-stolen.
+        Accept a new note trigger only if enough time has passed since the last
+        one (TRIGGER_RATE_LIMIT gate). This is what gives notes room to breathe —
+        without it, sort algorithms fire thousands of triggers per second and no
+        individual note ever develops past its first few milliseconds of attack.
         """
+        now = time.monotonic()
+        if now - self._last_t < TRIGGER_RATE_LIMIT:
+            return                      # too soon — drop this trigger
+        self._last_t = now
+
         ratio = value / max_value
         freq  = FREQ_LOW + ratio * (FREQ_HIGH - FREQ_LOW)
-        osc   = _Osc(freq, self.sustain_smp, self.attack_smp, self.release_smp)
+        osc   = _Osc(freq, self._sustain_smp, self._attack_smp, self._release_smp)
+
         with self._lock:
-            # Voice steal: clamp oldest oscillator to a fast fade-out
+            # Voice steal: if at capacity, clamp oldest voice to a fast cosine fade
             if len(self._oscs) >= MAX_VOICES:
-                oldest = self._oscs[0]
-                steal_release   = min(VOICE_STEAL_FADE, oldest.release)
-                oldest.max_age  = oldest.age + steal_release
-                oldest.release  = steal_release
+                old        = self._oscs[0]
+                fade       = min(256, old.release)
+                old.max_age = old.age + fade
+                old.release = fade
             self._oscs.append(osc)
 
-    def _gen_chunk(self) -> np.ndarray:
+    def _callback(self, outdata, frames, time_info, status):
         """
-        Synthesise one chunk of audio and return it as a float64 array.
+        sounddevice pull callback — called by the OS audio driver on a real-time
+        thread. outdata is a (frames, 1) float32 numpy array we fill in place.
 
-        Step-by-step per oscillator:
-          1. Compute per-sample phase array (vectorised with numpy)
-          2. Compute sine wave + optional 2nd harmonic
-          3. Compute raised-cosine envelope (attack / sustain / release)
-          4. Accumulate wave * envelope into the output buffer
-          5. Advance oscillator state (phase, age)
-          6. Remove finished oscillators
+        We synthesise all live oscillators sample-accurately, apply raised-cosine
+        envelopes, mix them down, and write the result into outdata.
+
+        Note: globals are captured as locals at the top of this function.
+        cffi C-thread callbacks can fail to resolve module globals reliably,
+        so we snapshot them into locals on every call to guarantee availability.
         """
-        buf = np.zeros(self.chunk_size, dtype=np.float64)
-        # Local sample indices within this chunk: [0, 1, 2, ..., CHUNK_SIZE-1]
-        idx = np.arange(self.chunk_size, dtype=np.float64)
+        # Snapshot globals into locals — safe against cffi thread scoping issues
+        h2   = HARMONIC_BLEND
+        h3   = HARMONIC_BLEND_3
+        sr   = SAMPLE_RATE
+        n    = frames
+        buf  = np.zeros(n, dtype=np.float64)
+        idx  = np.arange(n, dtype=np.float64)    # [0, 1, 2, ..., n-1]
 
         with self._lock:
             alive = []
             for o in self._oscs:
-                # Absolute sample age for each position in this chunk
-                abs_age = idx + o.age
+                t = idx + o.age
 
-                # ---- WAVEFORM ----
-                # Phase at each sample: (current_phase + sample_offset * freq/sr) mod 1
-                phases = (o.phase + idx * (o.freq / self.sample_rate)) % 1.0
-                # Pure sine (phase in [0,1] maps to angle in [0, 2pi])
-                wave = np.sin(TWO_PI * phases)
-                # Subtle 2nd harmonic — still a sine, adds warmth not buzz
-                if HARMONIC_BLEND > 0.0:
-                    wave += HARMONIC_BLEND * np.sin(TWO_PI * 2.0 * phases)
+                # --- WAVEFORM ---
+                phases = (o.phase + idx * (o.freq / sr)) % 1.0
+                wave   = np.sin(TWO_PI * phases)
+                if h2 > 0.0:
+                    wave += h2 * np.sin(TWO_PI * 2.0 * phases)
+                if h3 > 0.0:
+                    wave += h3 * np.sin(TWO_PI * 3.0 * phases)
 
-                # ---- ENVELOPE ----
-                env = np.ones(self.chunk_size, dtype=np.float64)
+                # --- ENVELOPE (raised-cosine across all three regions) ---
+                env = np.ones(n, dtype=np.float64)
 
-                # Attack: raised-cosine fade-in
-                #   env = 0.5 * (1 - cos(pi * t / A))
-                #   At t=0: env=0, at t=A: env=1 — smooth, click-free onset
-                a_mask = abs_age < o.attack
-                if np.any(a_mask):
-                    env[a_mask] = 0.5 * (1.0 - np.cos(math.pi * abs_age[a_mask] / o.attack))
+                a_mask = t < o.attack
+                if a_mask.any():
+                    env[a_mask] = 0.5 * (1.0 - np.cos(math.pi * t[a_mask] / o.attack))
 
-                # Release: raised-cosine fade-out (mirror of attack)
-                #   env = 0.5 * (1 + cos(pi * (t - rel_start) / R))
-                #   At t=rel_start: env=1, at t=max_age: env=0 — smooth tail
-                rel_start = o.max_age - o.release
-                r_mask = abs_age >= rel_start
-                if np.any(r_mask):
-                    env[r_mask] = 0.5 * (1.0 + np.cos(
-                        math.pi * (abs_age[r_mask] - rel_start) / o.release
-                    ))
-                    env[r_mask] = np.maximum(0.0, env[r_mask])
+                rs     = o.max_age - o.release
+                r_mask = t >= rs
+                if r_mask.any():
+                    env[r_mask] = 0.5 * (1.0 + np.cos(math.pi * (t[r_mask] - rs) / o.release))
+                    np.maximum(env, 0.0, out=env)
 
-                # Zero out anything past the end (safety net)
-                env[abs_age >= o.max_age] = 0.0
+                env[t >= o.max_age] = 0.0
 
                 buf += wave * env
 
-                # Advance oscillator state for next chunk
-                o.phase = (o.phase + self.chunk_size * (o.freq / self.sample_rate)) % 1.0
-                o.age  += self.chunk_size
-
+                o.phase = (o.phase + n * o.freq / sr) % 1.0
+                o.age  += n
                 if o.age < o.max_age:
                     alive.append(o)
 
             self._oscs = alive
-            n_voices = max(1, len(alive))
+            n_voices   = len(alive)
 
-        # RMS-aware normalisation: divide by sqrt(n) keeps perceived loudness stable
-        # (pure /n is too quiet with few voices; sqrt is a perceptual sweet spot)
-        buf /= math.sqrt(n_voices) * (1.0 + HARMONIC_BLEND)
-        return buf
+        peak_per_voice = 1.0 + h2 + h3
+        if n_voices > 0:
+            buf /= (math.sqrt(n_voices) * peak_per_voice)
 
-    def _loop(self):
-        """
-        Audio thread: generates chunks and queues them to the pygame mixer channel.
-        Runs slightly ahead of playback to avoid gaps (queue up to 4 chunks).
-        """
-        chunk_secs = self.chunk_size / self.sample_rate
-        while self._running:
-            mono   = self._gen_chunk()
-            # Convert float [-1,1] to int16, scale to 85% of max for headroom
-            pcm    = (np.clip(mono, -1.0, 1.0) * 32767 * 0.85).astype(np.int16)
-            # Duplicate mono to stereo (L/R identical)
-            stereo = np.column_stack((pcm, pcm))
-            snd    = pygame.mixer.Sound(buffer=stereo.tobytes())
-            deadline = time.monotonic() + chunk_secs * 4
-            while self._channel.get_queue() is not None and self._running:
-                time.sleep(0.001)
-                if time.monotonic() > deadline:
-                    break
-            if self._running:
-                self._channel.queue(snd)
-            time.sleep(chunk_secs * 0.75)
+        DRIVE = 1.0 / 0.85
+        outdata[:] = (np.tanh(buf * DRIVE) * 0.85).astype(np.float32).reshape(-1, 1)
 
 
-_engine: SoundEngine | None = None
+# --------------- Pygame mixer fallback ---------------
+# Used only when sounddevice is not installed.
+
+class _PygameFallbackEngine:
+    """
+    Minimal pygame.mixer fallback. Sounds noticeably worse than the sounddevice
+    engine (choppy, no true sustain) but at least something plays.
+    Install sounddevice for the full silky experience:  pip install sounddevice
+    """
+    def __init__(self):
+        self._last_t = 0.0
+
+    def start(self):
+        pygame.mixer.pre_init(SAMPLE_RATE, -16, 1, CHUNK_SIZE)
+        pygame.mixer.init()
+
+    def stop(self):
+        pygame.mixer.quit()
+
+    def trigger(self, value: int, max_value: int):
+        now = time.monotonic()
+        if now - self._last_t < TRIGGER_RATE_LIMIT:
+            return
+        self._last_t = now
+
+        ratio  = value / max_value
+        freq   = FREQ_LOW + ratio * (FREQ_HIGH - FREQ_LOW)
+        n      = int(SOUND_SUSTAIN * SAMPLE_RATE)
+        t      = np.arange(n, dtype=np.float64)
+        wave   = np.sin(TWO_PI * freq * t / SAMPLE_RATE)
+        env    = 0.5 * (1.0 - np.cos(TWO_PI * t / n))
+        pcm    = (wave * env * 32767 * 0.7).astype(np.int16)
+        snd    = pygame.mixer.Sound(buffer=pcm.tobytes())
+        snd.play()
+
+
+# ---- global engine instance ----
+
+_engine = None
 
 
 def init_sound():
     global _engine
-    pygame.mixer.pre_init(SAMPLE_RATE, -16, 2, CHUNK_SIZE)
-    pygame.mixer.init()
-    _engine = SoundEngine()
+    if HAS_SD:
+        _engine = SoundEngine()
+    else:
+        print("[SuperSolver] sounddevice not found — using pygame fallback. "
+              "Install with:  pip install sounddevice")
+        _engine = _PygameFallbackEngine()
+        pygame.mixer.pre_init(SAMPLE_RATE, -16, 1, CHUNK_SIZE)
+        pygame.mixer.init()
     _engine.start()
 
 
@@ -359,13 +442,8 @@ def stop_sound():
 
 
 def trigger_tone(value: int, max_value: int):
-    global _last_trigger_time
-    if not (_engine and ENABLE_SOUND):
-        return
-    now = time.monotonic()
-    if now - _last_trigger_time >= TRIGGER_MIN_INTERVAL:
+    if _engine and ENABLE_SOUND:
         _engine.trigger(value, max_value)
-        _last_trigger_time = now
 
 
 # ============================================================
@@ -659,7 +737,7 @@ def load_sortpack(zip_path):
 
 if sys.platform == "win32":
     APPDATA = os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
-    SORTPACK_DIR = os.path.join(APPDATA, "SuperSorter", "SortPacks")
+    SORTPACK_DIR = os.path.join(APPDATA, "SuperSolver", "SortPacks")
 else:
     SORTPACK_DIR = os.path.expanduser("~/.supersorter/sortpacks")
 
@@ -837,10 +915,63 @@ class SmBtn:
 
 
 # ============================================================
-# ========================= MENU =============================
+# ========================= TAB BAR ==========================
+# ============================================================
+#
+# TAB_SORT and TAB_MAZE are the two top-level modes.
+# The TabBar widget draws two pill-shaped buttons at the top of the window
+# and returns which tab is active. The main loop swaps between SortMenu
+# and MazeMenu based on this selection.
+
+TAB_SORT = 0
+TAB_MAZE = 1
+TAB_LABELS = ["  SORT  ", "  MAZE  "]
+
+class TabBar:
+    """
+    Two-tab switcher rendered to the RIGHT of the title text.
+    TAB_X is set to clear "SuperSolver  20 algorithms" comfortably.
+    H and Y are chosen to sit neatly centred in the 48px title row.
+    """
+    H    = 28
+    BTNW = 100
+    TAB_X = 320   # left edge of first tab — clears the title + subtitle
+    Y     = 14    # vertically centred in the ~48px title row
+
+    def __init__(self):
+        self._rects = []
+        for i, lbl in enumerate(TAB_LABELS):
+            x = self.TAB_X + i * (self.BTNW + 6)
+            self._rects.append((pygame.Rect(x, self.Y, self.BTNW, self.H), lbl))
+
+    def handle(self, ev, active_tab):
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            for i, (r, _) in enumerate(self._rects):
+                if r.collidepoint(ev.pos):
+                    return i
+        return None
+
+    def draw(self, s, fonts, active_tab):
+        mp = pygame.mouse.get_pos()
+        for i, (r, lbl) in enumerate(self._rects):
+            sel = (i == active_tab)
+            hov = r.collidepoint(mp) and not sel
+            bg  = UI_ACCENT  if sel else (UI_HOVER if hov else UI_PANEL2)
+            fc  = (0, 0, 0)  if sel else (UI_TEXT  if hov else UI_SUBTEXT)
+            pygame.draw.rect(s, bg,        r, border_radius=8)
+            pygame.draw.rect(s, UI_BORDER if not sel else UI_ACCENT, r, 1, border_radius=8)
+            t = fonts['small'].render(lbl, True, fc)
+            s.blit(t, t.get_rect(center=r.center))
+
+# ============================================================
+# ========================= SORT MENU ========================
 # ============================================================
 
-class Menu:
+class SortMenu:
+    """
+    The original sorting algorithm selection menu.
+    Moved into its own class so it can live alongside MazeMenu under a tab bar.
+    """
     def __init__(self, screen, fonts):
         self.screen    = screen
         self.fonts     = fonts
@@ -853,6 +984,7 @@ class Menu:
 
         self._build_btns()
 
+        # Content starts below tab bar (TAB_H) + title area
         self.sl_size  = Slider(RX, _Y_SIZE,  RW, 4, MAX_ARRAY_SIZE, 32, "Array Size", is_int=True)
         self.sl_speed = Slider(RX, _Y_SPEED, RW, 0.25, 8.0, 1.0, "Speed")
         self.sl_freq  = FreqRangeSlider(RX, _Y_FREQ, RW, FREQ_LOW, FREQ_HIGH)
@@ -951,7 +1083,6 @@ class Menu:
                         first_line = md_content.strip().splitlines()[0]
                         if first_line:
                             sortpack_name = first_line.strip()
-
                     temp_dir = os.path.join(_SCRIPT_DIR, "__sortpack_temp__")
                     os.makedirs(temp_dir, exist_ok=True)
                     py_files = [f for f in z.namelist() if f.lower().endswith(".py")]
@@ -963,29 +1094,25 @@ class Menu:
                             name, key = result
                             if not any(k == key for _, k in ALGORITHMS):
                                 ALGORITHMS.append((name, key))
-
                     _save_autoload_json()
                     self._build_btns()
                     self.sel = len(ALGORITHMS) - 1
                     self._notify(f"Loaded SortPack: {sortpack_name}", ok=True)
-
             except Exception as e:
                 self._notify(f"Failed to load SortPack: {str(e)[:50]}", ok=False)
 
     def draw(self):
         s  = self.screen
         mp = pygame.mouse.get_pos()
-        s.fill(UI_BG)
 
-        t1 = self.fonts['title'].render("SuperSorter", True, UI_TEXT)
-        t2 = self.fonts['title'].render("SuperSorter", True, UI_ACCENT)
+        t1 = self.fonts['title'].render("SuperSolver", True, UI_TEXT)
+        t2 = self.fonts['title'].render("SuperSolver", True, UI_ACCENT)
         s.blit(t2, (PAD+1, 23)); s.blit(t1, (PAD, 22))
         s.blit(self.fonts['small'].render(f"{len(ALGORITHMS)} algorithms", True, UI_SUBTEXT),
                (PAD + t1.get_width() + 12, 31))
         pygame.draw.line(s, UI_BORDER, (PAD, 68), (WINDOW_WIDTH-PAD, 68), 1)
 
         for b in self.btns: b.draw(s, self.fonts, b.idx==self.sel, b.idx==self.hov)
-
         self.load_btn.draw(s, self.fonts, False, self.load_btn.rect.collidepoint(mp))
 
         now = pygame.time.get_ticks()
@@ -1006,8 +1133,7 @@ class Menu:
         self.sl_freq.draw(s, self.fonts)
 
         if self._is_radix():
-            s.blit(self.fonts['small'].render("Radix Base:", True, UI_SUBTEXT),
-                   (RX, _Y_RADIX))
+            s.blit(self.fonts['small'].render("Radix Base:", True, UI_SUBTEXT), (RX, _Y_RADIX))
             for sb, base in self.base_btns:
                 sb.draw(s, self.fonts, self.radix_base==base, sb.rect.collidepoint(mp))
 
@@ -1036,8 +1162,6 @@ class Menu:
         st2 = self.fonts['big'].render("> START", True, (255, 255, 255))
         s.blit(st2, st2.get_rect(center=self.start_rect.center))
 
-        pygame.display.flip()
-
     def config(self):
         nm, ky = ALGORITHMS[self.sel]
         return dict(
@@ -1049,6 +1173,748 @@ class Menu:
             radix_base=self.radix_base,
             sound=self.sound_on,
         )
+
+# ============================================================
+# ====================== MAZE ALGORITHMS =====================
+# ============================================================
+#
+# HOW MAZE PATHFINDING GENERATORS WORK
+# ======================================
+# Every maze algorithm is a Python generator that yields tuples describing
+# the current visualisation state after each logical step:
+#
+#   yield (visited_set, frontier_set, path_list, current_cell)
+#
+#   visited_set   : set of (row, col) cells already fully explored
+#   frontier_set  : set of (row, col) cells currently being considered
+#   path_list     : list of (row, col) cells on the best path found so far
+#   current_cell  : (row, col) of the cell being processed this step
+#
+# The maze itself is a 2-D grid of 0 (open) or 1 (wall).
+# Cells outside the grid and cells with value 1 are impassable.
+#
+# MAZE GENERATION — Recursive Backtracker (perfect maze)
+# =======================================================
+# Starts at top-left, carves passages by choosing a random unvisited
+# neighbour 2 cells away (so walls stay between cells), removing the
+# wall between them, and recursing. This guarantees exactly one path
+# between any two cells (a "perfect" maze with no loops).
+#
+# CUSTOM MAZE LOADER
+# ===================
+# A custom maze .py file may define:
+#   NAME  : str    — display name
+#   solve(grid, start, end) -> generator  yielding (visited, frontier, path, current)
+# Drop it in via "[+] Load Custom Solver" just like custom sorters.
+
+import heapq
+from collections import deque
+
+_custom_maze_solvers: dict = {}
+MAZE_AUTOLOAD_JSON = os.path.join(_SCRIPT_DIR, "supersorter_maze_custom.json")
+
+
+def _save_maze_autoload_json():
+    paths = [info["path"] for info in _custom_maze_solvers.values() if "path" in info]
+    try:
+        with open(MAZE_AUTOLOAD_JSON, "w") as f:
+            json.dump({"custom_solvers": paths}, f, indent=2)
+    except Exception:
+        pass
+
+
+def load_custom_maze_solver(filepath: str):
+    """
+    Load a .py file as a custom maze solver.
+    Must define: solve(grid, start, end) generator.
+    Optional: NAME str.
+    Returns ((name, key), None) on success, (None, err_str) on failure.
+    """
+    try:
+        filepath = os.path.abspath(filepath)
+        spec     = importlib.util.spec_from_file_location("_cms", filepath)
+        module   = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "solve"):
+            return None, "No solve(grid, start, end) function found"
+        fn   = module.solve
+        name = getattr(module, "NAME", os.path.splitext(os.path.basename(filepath))[0])
+        key  = f"maze_custom_{len(_custom_maze_solvers)}"
+        _custom_maze_solvers[key] = {"fn": fn, "path": filepath}
+        return (name, key), None
+    except Exception as e:
+        return None, str(e)
+
+
+def _autoload_maze_solvers():
+    if not os.path.exists(MAZE_AUTOLOAD_JSON):
+        return
+    try:
+        with open(MAZE_AUTOLOAD_JSON) as f:
+            paths = json.load(f).get("custom_solvers", [])
+    except Exception:
+        return
+    for path in paths:
+        if os.path.exists(path):
+            result, _ = load_custom_maze_solver(path)
+            if result:
+                name, key = result
+                MAZE_ALGORITHMS.append((name, key))
+
+
+def generate_maze(rows, cols):
+    """
+    Recursive-backtracker perfect maze generator.
+    Returns a 2-D list (rows x cols) of 0 (open) / 1 (wall).
+    Cells are on odd indices; walls between them on even indices.
+    The grid is always (2*rows+1) x (2*cols+1) in size.
+    Start = (1,1), End = (2*rows-1, 2*cols-1).
+    """
+    R, C = 2 * rows + 1, 2 * cols + 1
+    grid = [[1] * C for _ in range(R)]
+
+    def carve(r, c):
+        grid[r][c] = 0
+        dirs = [(0, 2), (0, -2), (2, 0), (-2, 0)]
+        random.shuffle(dirs)
+        for dr, dc in dirs:
+            nr, nc = r + dr, c + dc
+            if 0 < nr < R and 0 < nc < C and grid[nr][nc] == 1:
+                grid[r + dr//2][c + dc//2] = 0   # knock out wall between
+                carve(nr, nc)
+
+    sys.setrecursionlimit(10000)
+    carve(1, 1)
+    # Ensure end cell is open
+    grid[R-2][C-2] = 0
+    return grid
+
+
+def _neighbours(grid, r, c):
+    """4-connected passable neighbours of (r, c)."""
+    R, C = len(grid), len(grid[0])
+    for dr, dc in ((-1,0),(1,0),(0,-1),(0,1)):
+        nr, nc = r+dr, c+dc
+        if 0 <= nr < R and 0 <= nc < C and grid[nr][nc] == 0:
+            yield nr, nc
+
+
+# ---- A* (Manhattan heuristic) ----
+def maze_astar(grid, start, end):
+    """
+    A* search with Manhattan distance heuristic.
+    Explores the cell that minimises f = g (cost so far) + h (heuristic).
+    h = |row_diff| + |col_diff| — admissible for 4-connected grids so A*
+    is guaranteed to find the shortest path.
+
+    Yields (visited, frontier, path, current) after each cell pop.
+    """
+    er, ec   = end
+    g_score  = {start: 0}
+    came_from = {}
+    # heap entries: (f_score, g_score, cell)
+    heap     = [(abs(start[0]-er)+abs(start[1]-ec), 0, start)]
+    visited  = set()
+    frontier = {start}
+
+    def reconstruct(node):
+        path = []
+        while node in came_from:
+            path.append(node)
+            node = came_from[node]
+        path.append(start)
+        return path[::-1]
+
+    while heap:
+        _, g, cur = heapq.heappop(heap)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        frontier.discard(cur)
+        yield visited.copy(), frontier.copy(), reconstruct(cur) if cur == end else [], cur
+        if cur == end:
+            return
+        for nb in _neighbours(grid, *cur):
+            ng = g + 1
+            if ng < g_score.get(nb, 10**9):
+                g_score[nb]   = ng
+                came_from[nb] = cur
+                h = abs(nb[0]-er) + abs(nb[1]-ec)
+                heapq.heappush(heap, (ng + h, ng, nb))
+                frontier.add(nb)
+
+
+# ---- BFS (Breadth-First Search) ----
+def maze_bfs(grid, start, end):
+    """
+    BFS explores in expanding rings of equal distance from start.
+    Guarantees shortest path on unweighted grids.
+    Frontier = the current wave front (cells at the same distance).
+
+    Yields (visited, frontier, path, current) after each cell dequeue.
+    """
+    queue      = deque([start])
+    came_from  = {start: None}
+    visited    = set()
+
+    def reconstruct(node):
+        path = []
+        while node is not None:
+            path.append(node)
+            node = came_from[node]
+        return path[::-1]
+
+    while queue:
+        cur = queue.popleft()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        frontier = set(queue)
+        yield visited.copy(), frontier, reconstruct(cur) if cur == end else [], cur
+        if cur == end:
+            return
+        for nb in _neighbours(grid, *cur):
+            if nb not in came_from:
+                came_from[nb] = cur
+                queue.append(nb)
+
+
+# ---- DFS (Depth-First Search) ----
+def maze_dfs(grid, start, end):
+    """
+    DFS dives as deep as possible before backtracking.
+    Does NOT guarantee shortest path but explores dramatically —
+    it often finds a winding, scenic route.
+    Uses an explicit stack to avoid Python recursion limits on large mazes.
+
+    Yields (visited, frontier, path, current) after each cell pop.
+    """
+    stack      = [start]
+    came_from  = {start: None}
+    visited    = set()
+
+    def reconstruct(node):
+        path = []
+        while node is not None:
+            path.append(node)
+            node = came_from[node]
+        return path[::-1]
+
+    while stack:
+        cur = stack.pop()
+        if cur in visited:
+            continue
+        visited.add(cur)
+        frontier = set(stack)
+        yield visited.copy(), frontier, reconstruct(cur) if cur == end else [], cur
+        if cur == end:
+            return
+        for nb in _neighbours(grid, *cur):
+            if nb not in visited:
+                if nb not in came_from:
+                    came_from[nb] = cur
+                stack.append(nb)
+
+
+# ---- Dijkstra ----
+def maze_dijkstra(grid, start, end):
+    """
+    Dijkstra's algorithm — like A* but with h=0 (no heuristic).
+    On unweighted grids this is equivalent to BFS but uses a priority
+    queue, making it easy to extend to weighted edges.
+
+    Yields (visited, frontier, path, current) after each cell pop.
+    """
+    dist       = {start: 0}
+    came_from  = {}
+    heap       = [(0, start)]
+    visited    = set()
+    frontier   = {start}
+
+    def reconstruct(node):
+        path = []
+        while node in came_from:
+            path.append(node)
+            node = came_from[node]
+        path.append(start)
+        return path[::-1]
+
+    while heap:
+        d, cur = heapq.heappop(heap)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        frontier.discard(cur)
+        yield visited.copy(), frontier.copy(), reconstruct(cur) if cur == end else [], cur
+        if cur == end:
+            return
+        for nb in _neighbours(grid, *cur):
+            nd = d + 1
+            if nd < dist.get(nb, 10**9):
+                dist[nb]      = nd
+                came_from[nb] = cur
+                heapq.heappush(heap, (nd, nb))
+                frontier.add(nb)
+
+
+# ---- Greedy Best-First ----
+def maze_greedy(grid, start, end):
+    """
+    Greedy Best-First: always expands the cell closest to the end
+    by heuristic alone (ignores actual cost so far).
+    Very fast to find *a* path but not guaranteed to be shortest.
+    Visually dramatic — it beelines toward the goal aggressively.
+
+    Yields (visited, frontier, path, current) after each cell pop.
+    """
+    er, ec     = end
+    came_from  = {}
+    heap       = [(abs(start[0]-er)+abs(start[1]-ec), start)]
+    visited    = set()
+    frontier   = {start}
+
+    def reconstruct(node):
+        path = []
+        while node in came_from:
+            path.append(node)
+            node = came_from[node]
+        path.append(start)
+        return path[::-1]
+
+    while heap:
+        _, cur = heapq.heappop(heap)
+        if cur in visited:
+            continue
+        visited.add(cur)
+        frontier.discard(cur)
+        yield visited.copy(), frontier.copy(), reconstruct(cur) if cur == end else [], cur
+        if cur == end:
+            return
+        for nb in _neighbours(grid, *cur):
+            if nb not in visited:
+                came_from.setdefault(nb, cur)
+                h = abs(nb[0]-er) + abs(nb[1]-ec)
+                heapq.heappush(heap, (h, nb))
+                frontier.add(nb)
+
+
+# ---- Wall Follower (Right-Hand Rule) ----
+def maze_wall_follower(grid, start, end):
+    """
+    Right-hand rule: always try to turn right first, then go straight,
+    then left, then back. Works on mazes where the start and end are
+    connected to the outer wall (i.e. simply-connected mazes).
+    Will NOT always solve mazes with islands (loops).
+
+    Facing: 0=up 1=right 2=down 3=left
+    Yields (visited, frontier, path, current) after each step.
+    """
+    # Direction vectors for up/right/down/left
+    DR = [-1, 0, 1,  0]
+    DC = [ 0, 1, 0, -1]
+    r, c    = start
+    facing  = 2          # start facing down (into the maze)
+    visited = set()
+    path    = [start]
+    steps   = 0
+    max_steps = len(grid) * len(grid[0]) * 8
+
+    while (r, c) != end and steps < max_steps:
+        visited.add((r, c))
+        yield visited.copy(), set(), path[:], (r, c)
+        # Try: right, straight, left, back
+        for turn in (-1, 0, 1, 2):
+            nf = (facing + 1 + turn) % 4     # right = facing+1, straight = facing+0, left = facing-1
+            # Re-map: turn=-1→right, turn=0→straight, turn=1→left, turn=2→back
+            nf = (facing + [1, 0, -1, 2][turn + 1]) % 4
+            nr, nc = r + DR[nf], c + DC[nf]
+            if 0 <= nr < len(grid) and 0 <= nc < len(grid[0]) and grid[nr][nc] == 0:
+                facing = nf
+                r, c   = nr, nc
+                path.append((r, c))
+                break
+        steps += 1
+
+    visited.add(end)
+    yield visited.copy(), set(), path if (r,c)==end else [], end
+
+
+# ---- Dead-End Filling ----
+def maze_dead_end_fill(grid, start, end):
+    """
+    Dead-end filling: repeatedly find cells with exactly one open
+    neighbour (dead ends) and fill them in as walls — except start/end.
+    What remains is the solution path(s).
+    This is a reduction algorithm, not a search — it reveals the path
+    by eliminating everything that ISN'T the path.
+
+    Yields (visited/filled set, frontier, path, current) each fill step.
+    """
+    R, C   = len(grid), len(grid[0])
+    filled = [[grid[r][c] for c in range(C)] for r in range(R)]
+    filled_cells = set()
+
+    def open_count(r, c):
+        return sum(1 for nr, nc in _neighbours(filled, r, c))
+
+    changed = True
+    while changed:
+        changed = False
+        for r in range(R):
+            for c in range(C):
+                if filled[r][c] == 0 and (r, c) not in (start, end):
+                    if open_count(r, c) == 1:
+                        filled[r][c] = 1
+                        filled_cells.add((r, c))
+                        changed = True
+                        # Build remaining path = open cells minus filled
+                        path = [(rr,cc) for rr in range(R) for cc in range(C)
+                                if filled[rr][cc]==0]
+                        yield filled_cells.copy(), set(), path, (r, c)
+
+    path = [(r,c) for r in range(R) for c in range(C) if filled[r][c]==0]
+    yield filled_cells.copy(), set(), path, end
+
+
+MAZE_ALGORITHMS = [
+    ("A* (Manhattan)",    "astar"),
+    ("BFS",               "bfs"),
+    ("DFS",               "dfs"),
+    ("Dijkstra",          "dijkstra"),
+    ("Greedy Best-First", "greedy"),
+    ("Wall Follower",     "wall_follower"),
+    ("Dead-End Fill",     "dead_end_fill"),
+]
+
+def get_maze_generator(key, grid, start, end):
+    builtins = {
+        "astar":         lambda: maze_astar(grid, start, end),
+        "bfs":           lambda: maze_bfs(grid, start, end),
+        "dfs":           lambda: maze_dfs(grid, start, end),
+        "dijkstra":      lambda: maze_dijkstra(grid, start, end),
+        "greedy":        lambda: maze_greedy(grid, start, end),
+        "wall_follower": lambda: maze_wall_follower(grid, start, end),
+        "dead_end_fill": lambda: maze_dead_end_fill(grid, start, end),
+    }
+    if key in builtins: return builtins[key]()
+    if key in _custom_maze_solvers: return _custom_maze_solvers[key]["fn"](grid, start, end)
+    raise KeyError(f"Unknown maze key: {key}")
+
+
+# ============================================================
+# ========================= MAZE MENU ========================
+# ============================================================
+#
+# Layout:
+#   Left panel  — algorithm buttons (2 cols)
+#   Right panel — settings + start button (same RX/RW as sort menu)
+#
+# Maze size slider controls the N in an N×N logical cell grid.
+# The rendered grid is (2N+1)×(2N+1) pixels mapped to the window.
+
+_MZ_COLS   = 2
+_MZ_BTN_W  = (GRID_W - (_MZ_COLS-1)*COL_GAP) // _MZ_COLS
+_MZ_BTN_H  = 38
+
+# Right-panel Y anchors for maze settings
+_MY_SETTINGS = 88
+_MY_SIZE     = 108
+_MY_SPEED    = 162
+_MY_GEN      = 216   # maze generation style label+buttons
+
+
+class MazeMenu:
+    """
+    Algorithm selection and settings panel for Maze mode.
+    Mirrors SortMenu's structure so the tab switch feels seamless.
+    """
+    GEN_STYLES = [("Recursive", "recurse"), ("Prim's", "prims"), ("Empty", "empty")]
+
+    def __init__(self, screen, fonts):
+        self.screen    = screen
+        self.fonts     = fonts
+        self.sel       = 0
+        self.hov       = -1
+        self.msg       = ""
+        self.msg_until = 0
+        self.msg_ok    = True
+        self.gen_style = "recurse"
+
+        self._build_btns()
+
+        self.sl_size  = Slider(RX, _MY_SIZE,  RW, 5, 40, 15, "Maze Size (N)", is_int=True)
+        self.sl_speed = Slider(RX, _MY_SPEED, RW, 0.25, 16.0, 2.0, "Speed")
+
+        # Generation style buttons
+        gsw = (RW - (len(self.GEN_STYLES)-1)*5) // len(self.GEN_STYLES)
+        self.gen_btns = []
+        for i, (lbl, key) in enumerate(self.GEN_STYLES):
+            self.gen_btns.append((SmBtn(RX + i*(gsw+5), _MY_GEN+16, gsw, 26, lbl), key))
+
+        self.start_rect = pygame.Rect(RX, WINDOW_HEIGHT-62, RW, 46)
+        self.start_hov  = False
+
+    def _build_btns(self):
+        gx, gy = PAD, 80
+        self.btns = []
+        for i, (nm, ky) in enumerate(MAZE_ALGORITHMS):
+            col = i % _MZ_COLS; row = i // _MZ_COLS
+            x   = gx + col*(_MZ_BTN_W + COL_GAP)
+            y   = gy + row*(_MZ_BTN_H + BTN_GAP)
+            self.btns.append(AlgoBtn(x, y, _MZ_BTN_W, nm, ky, i))
+
+        rows_used = (len(MAZE_ALGORITHMS) + _MZ_COLS - 1) // _MZ_COLS
+        load_y    = gy + rows_used*(_MZ_BTN_H + BTN_GAP) + 4
+        self.load_btn = SmBtn(gx, load_y, GRID_W, 30, "[+] Load Custom Solver")
+
+    def _notify(self, msg, ok=True):
+        self.msg = msg; self.msg_ok = ok
+        self.msg_until = pygame.time.get_ticks() + 4000
+
+    def handle(self, ev):
+        self.sl_size.handle(ev)
+        self.sl_speed.handle(ev)
+
+        if ev.type == pygame.MOUSEMOTION:
+            self.hov = -1
+            self.start_hov = self.start_rect.collidepoint(ev.pos)
+            for b in self.btns:
+                if b.rect.collidepoint(ev.pos): self.hov = b.idx
+
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            for b in self.btns:
+                if b.rect.collidepoint(ev.pos): self.sel = b.idx
+
+            for sb, key in self.gen_btns:
+                if sb.rect.collidepoint(ev.pos): self.gen_style = key
+
+            if self.load_btn.rect.collidepoint(ev.pos):
+                self._do_load()
+
+            if self.start_rect.collidepoint(ev.pos):
+                return "start"
+
+        return None
+
+    def _do_load(self):
+        path = open_file_dialog()
+        if not path or not path.lower().endswith(".py"): return
+        result, err = load_custom_maze_solver(path)
+        if err:
+            self._notify(f"Error: {err[:55]}", ok=False)
+            return
+        name, key = result
+        MAZE_ALGORITHMS.append((name, key))
+        _save_maze_autoload_json()
+        self._build_btns()
+        self.sel = len(MAZE_ALGORITHMS) - 1
+        self._notify(f"Loaded: {name}", ok=True)
+
+    def draw(self):
+        s  = self.screen
+        mp = pygame.mouse.get_pos()
+
+        # Title
+        t1 = self.fonts['title'].render("SuperSolver", True, UI_TEXT)
+        t2 = self.fonts['title'].render("SuperSolver", True, UI_ACCENT)
+        s.blit(t2, (PAD+1, 23)); s.blit(t1, (PAD, 22))
+        s.blit(self.fonts['small'].render(f"{len(MAZE_ALGORITHMS)} solvers", True, UI_SUBTEXT),
+               (PAD + t1.get_width() + 12, 31))
+        pygame.draw.line(s, UI_BORDER, (PAD, 68), (WINDOW_WIDTH-PAD, 68), 1)
+
+        # Algorithm buttons
+        for b in self.btns:
+            b.draw(s, self.fonts, b.idx==self.sel, b.idx==self.hov)
+        self.load_btn.draw(s, self.fonts, False, self.load_btn.rect.collidepoint(mp))
+
+        now = pygame.time.get_ticks()
+        if self.msg and now < self.msg_until:
+            col = UI_GREEN if self.msg_ok else (255, 90, 90)
+            s.blit(self.fonts['small'].render(self.msg, True, col),
+                   (PAD, self.load_btn.rect.bottom + 6))
+        elif now >= self.msg_until:
+            self.msg = ""
+
+        # Right panel
+        panel = pygame.Rect(RX-10, 76, RW+20, WINDOW_HEIGHT-82)
+        pygame.draw.rect(s, UI_PANEL,  panel, border_radius=7)
+        pygame.draw.rect(s, UI_BORDER, panel, 1, border_radius=7)
+        s.blit(self.fonts['small'].render("SETTINGS", True, UI_SUBTEXT), (RX, _MY_SETTINGS))
+
+        self.sl_size.draw(s, self.fonts)
+        self.sl_speed.draw(s, self.fonts)
+
+        # Maze generation style
+        s.blit(self.fonts['small'].render("Generation:", True, UI_SUBTEXT), (RX, _MY_GEN))
+        for sb, key in self.gen_btns:
+            sb.draw(s, self.fonts, self.gen_style==key, sb.rect.collidepoint(mp))
+
+        # Selected info
+        nm, _ = MAZE_ALGORITHMS[self.sel]
+        y_sel  = _MY_GEN + 16 + 26 + 16
+        s.blit(self.fonts['small'].render("Selected:", True, UI_SUBTEXT), (RX, y_sel))
+        s.blit(self.fonts['mid'].render(nm, True, UI_ACCENT), (RX, y_sel+16))
+        s.blit(self.fonts['small'].render("ESC during solve returns here", True, UI_DIM),
+               (RX, y_sel+36))
+
+        # Start button
+        sh = self.start_hov
+        pygame.draw.rect(s, (240,50,50) if sh else (200,35,35), self.start_rect, border_radius=7)
+        pygame.draw.rect(s, (255,90,90) if sh else UI_ACCENT,   self.start_rect, 2, border_radius=7)
+        st2 = self.fonts['big'].render("> START", True, (255, 255, 255))
+        s.blit(st2, st2.get_rect(center=self.start_rect.center))
+
+    def config(self):
+        nm, ky = MAZE_ALGORITHMS[self.sel]
+        return dict(name=nm, key=ky,
+                    size=self.sl_size.value,
+                    speed=self.sl_speed.value,
+                    gen_style=self.gen_style)
+
+
+# ============================================================
+# ====================== MAZE GENERATION =====================
+# ============================================================
+
+def _gen_prims(rows, cols):
+    """
+    Prim's randomised maze generation.
+    Starts with a grid of walls, picks a random cell, adds its neighbours
+    to a frontier list, and repeatedly picks a random frontier cell to
+    connect to the already-visited region — carving a passage as it goes.
+    Produces mazes with shorter average corridors and more branching than
+    the recursive backtracker.
+    """
+    R, C  = 2*rows+1, 2*cols+1
+    grid  = [[1]*C for _ in range(R)]
+    start = (1, 1)
+    grid[1][1] = 0
+
+    def cell_neighbours_2(r, c):
+        for dr, dc in [(0,2),(0,-2),(2,0),(-2,0)]:
+            nr, nc = r+dr, c+dc
+            if 0 < nr < R and 0 < nc < C:
+                yield nr, nc
+
+    frontier = list(cell_neighbours_2(1, 1))
+    in_maze  = {(1,1)}
+
+    while frontier:
+        r, c = frontier.pop(random.randrange(len(frontier)))
+        if (r, c) in in_maze:
+            continue
+        # Find a neighbour already in maze and connect
+        nbrs_in = [(r+dr,c+dc) for dr,dc in [(-2,0),(2,0),(0,-2),(0,2)]
+                   if 0<r+dr<R and 0<c+dc<C and (r+dr,c+dc) in in_maze]
+        if nbrs_in:
+            nr, nc     = random.choice(nbrs_in)
+            grid[r][c] = 0
+            grid[(r+nr)//2][(c+nc)//2] = 0   # wall between them
+            in_maze.add((r, c))
+            for nb in cell_neighbours_2(r, c):
+                if nb not in in_maze:
+                    frontier.append(nb)
+
+    grid[R-2][C-2] = 0
+    return grid
+
+
+def _gen_empty(rows, cols):
+    """Open grid — no walls at all. Good for showing how search fans out."""
+    R, C = 2*rows+1, 2*cols+1
+    return [[0]*C for _ in range(R)]
+
+
+def build_maze_grid(size, style):
+    """
+    Build a maze grid of the given logical size using the chosen style.
+    Returns (grid, start_cell, end_cell).
+    start = (1,1), end = (2*size-1, 2*size-1) (bottom-right corner).
+    """
+    if style == "recurse":
+        grid = generate_maze(size, size)
+    elif style == "prims":
+        grid = _gen_prims(size, size)
+    else:
+        grid = _gen_empty(size, size)
+
+    R, C  = len(grid), len(grid[0])
+    start = (1, 1)
+    end   = (R-2, C-2)
+    return grid, start, end
+
+
+# ============================================================
+# ====================== MAZE VISUALISER =====================
+# ============================================================
+#
+# CELL COLOURS
+# =============
+# WALL        : near-black  (5, 5, 10)
+# OPEN        : dark grey   (28, 28, 40)
+# VISITED     : deep blue   (30, 80, 180) — cells already explored
+# FRONTIER    : cyan        (0, 200, 200) — cells currently queued
+# PATH        : bright blue (60, 160, 255) — solution path so far
+# CURRENT     : red accent  (255, 60, 60) — cell being processed this step
+# START       : green       (60, 200, 80)
+# END         : red         (220, 50, 50)
+
+MAZE_C_WALL     = (5,   5,  10)
+MAZE_C_OPEN     = (28,  28,  40)
+MAZE_C_VISITED  = (20,  60, 160)
+MAZE_C_FRONTIER = (0,  180, 200)
+MAZE_C_PATH     = (60, 160, 255)
+MAZE_C_CURRENT  = (255, 60,  60)
+MAZE_C_START    = (60, 200,  80)
+MAZE_C_END      = (220,  50,  50)
+
+
+def draw_maze(screen, grid, start, end, visited, frontier, path, current, label=""):
+    """
+    Render the maze onto the full screen.
+    Maps the grid cells to screen pixels so the maze fills most of the window.
+    """
+    screen.fill(MAZE_C_WALL)
+    R, C    = len(grid), len(grid[0])
+    margin  = 36           # pixels of margin on each side
+    cell_w  = (WINDOW_WIDTH  - 2*margin) / C
+    cell_h  = (WINDOW_HEIGHT - 2*margin - 20) / R
+
+    path_set     = set(path)
+    frontier_set = set(frontier)
+
+    for r in range(R):
+        for c in range(C):
+            x = int(margin + c * cell_w)
+            y = int(margin + r * cell_h)
+            w = max(1, int(cell_w))
+            h = max(1, int(cell_h))
+
+            if grid[r][c] == 1:
+                col = MAZE_C_WALL
+            elif (r, c) == current:
+                col = MAZE_C_CURRENT
+            elif (r, c) == start:
+                col = MAZE_C_START
+            elif (r, c) == end:
+                col = MAZE_C_END
+            elif (r, c) in path_set:
+                col = MAZE_C_PATH
+            elif (r, c) in frontier_set:
+                col = MAZE_C_FRONTIER
+            elif (r, c) in visited:
+                col = MAZE_C_VISITED
+            else:
+                col = MAZE_C_OPEN
+
+            pygame.draw.rect(screen, col, (x, y, w-1, h-1))
+
+    if label:
+        f = pygame.font.SysFont("consolas", 16)
+        screen.blit(f.render(label, True, (140, 140, 160)), (margin, 8))
+
+    pygame.display.flip()
+
 
 # ============================================================
 # ========================= MAIN =============================
@@ -1096,28 +1962,114 @@ def run_sort(screen, fonts, cfg):
             draw_bars(screen, arr, [], label + "  [SORTED]")
             pygame.time.wait(1800); return
 
+
+def run_maze(screen, fonts, cfg):
+    """
+    Main maze solving loop.
+    Builds the grid, runs the chosen solver generator, renders each step.
+    Speed slider maps directly to steps-per-frame (1x = 2 steps/frame,
+    16x = 32 steps/frame) so fast speeds skip visual frames for big mazes.
+
+    SOUND IN MAZE MODE
+    ===================
+    We reuse the same sine engine as the sort visualiser.
+    The current cell's row position is mapped to a frequency:
+        freq = FREQ_LOW + (row / max_row) * (FREQ_HIGH - FREQ_LOW)
+    This means the tone rises as the solver moves down the maze and
+    drops as it backtracks upward — creating a natural musical contour
+    that mirrors the visual search pattern.
+    trigger_tone() already applies the TRIGGER_RATE_LIMIT gate so we
+    can call it every step without worrying about flooding.
+    """
+    grid, start, end = build_maze_grid(cfg["size"], cfg["gen_style"])
+    gen   = get_maze_generator(cfg["key"], grid, start, end)
+    clock = pygame.time.Clock()
+    label = cfg["name"]
+    steps_per_frame = max(1, int(cfg["speed"] * 2))
+    max_row = max(1, len(grid) - 1)   # used for row → frequency mapping
+
+    visited  = set()
+    frontier = set()
+    path     = []
+    current  = start
+
+    solved = False
+    while True:
+        clock.tick(FPS)
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:   stop_sound(); pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE: return
+
+        if not solved:
+            for _ in range(steps_per_frame):
+                try:
+                    visited, frontier, path, current = next(gen)
+                    # Map current row to a tone value in [0, max_row]
+                    # trigger_tone expects (value, max_value) and maps linearly
+                    # to [FREQ_LOW, FREQ_HIGH], so passing row/max_row gives us
+                    # a pitch that follows vertical position through the maze.
+                    trigger_tone(current[0], max_row)
+                except StopIteration:
+                    solved = True
+                    break
+
+        suffix = "  [SOLVED]" if solved else ""
+        draw_maze(screen, grid, start, end, visited, frontier, path, current,
+                  label=f"{label}{suffix}  —  visited: {len(visited)}")
+
+        if solved:
+            pygame.time.wait(2200)
+            return
+
+
 def main():
     pygame.init(); init_sound()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("SuperSorter")
+    pygame.display.set_caption("SuperSolver")
     force_top()
     fonts = build_fonts(); clock = pygame.time.Clock()
 
     autoload_custom_sorters()
+    _autoload_maze_solvers()
+
+    # Active tab: TAB_SORT or TAB_MAZE
+    active_tab  = TAB_SORT
+    tab_bar     = TabBar()
+    sort_menu   = SortMenu(screen, fonts)
+    maze_menu   = MazeMenu(screen, fonts)
 
     while True:
-        menu = Menu(screen, fonts)
-        while True:
-            clock.tick(60)
-            for ev in pygame.event.get():
-                if ev.type == pygame.QUIT: stop_sound(); pygame.quit(); sys.exit()
-                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
-                    stop_sound(); pygame.quit(); sys.exit()
-                if menu.handle(ev) == "start":
-                    run_sort(screen, fonts, menu.config()); break
+        clock.tick(60)
+
+        # Draw background then tab bar on top of both menus
+        screen.fill(UI_BG)
+        if active_tab == TAB_SORT:
+            sort_menu.draw()
+        else:
+            maze_menu.draw()
+        tab_bar.draw(screen, fonts, active_tab)
+        pygame.display.flip()
+
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT:
+                stop_sound(); pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                stop_sound(); pygame.quit(); sys.exit()
+
+            # Tab bar gets first pick of clicks
+            new_tab = tab_bar.handle(ev, active_tab)
+            if new_tab is not None:
+                active_tab = new_tab
+                continue
+
+            if active_tab == TAB_SORT:
+                result = sort_menu.handle(ev)
+                if result == "start":
+                    run_sort(screen, fonts, sort_menu.config())
             else:
-                menu.draw(); continue
-            break
+                result = maze_menu.handle(ev)
+                if result == "start":
+                    run_maze(screen, fonts, maze_menu.config())
 
 if __name__ == "__main__":
     main()
