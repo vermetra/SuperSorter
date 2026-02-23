@@ -37,18 +37,50 @@ BACKGROUND_COLOR = (5, 5, 10)
 ACTIVE_COLOR     = (255, 60, 60)
 BAR_SPACING      = 1
 
-# Change this in your USER SETTINGS section
-SOUND_SUSTAIN = 3.9  # This will now act as a resonance factor
-
 ENABLE_SOUND  = True
 FREQ_LOW      = 24.0
 FREQ_HIGH     = 480.0
 FREQ_ABS_LOW  = 12.0
 FREQ_ABS_HIGH = 480.0
-FREQ_SNAP     = 12          # slider snaps to multiples of this
-SOUND_SUSTAIN = 0.10
+FREQ_SNAP     = 12
 SAMPLE_RATE   = 44100
 CHUNK_SIZE    = 512
+_last_trigger_time: float = 0.0
+TRIGGER_MIN_INTERVAL = 0.035
+
+# ============================================================
+# ====================== SOUND SETTINGS ======================
+# ============================================================
+#
+# SOUND_SUSTAIN — how long each tone rings out, in seconds.
+#   Higher = longer sustain / more overlap between notes.
+#   Good range: 0.08 (snappy) to 0.25 (lush/washy).
+SOUND_SUSTAIN = 0.18
+#
+# SOUND_ATTACK — fade-in time in seconds.
+#   A raised-cosine (Hann) window is used instead of a linear ramp,
+#   which eliminates the "click" you get at note onset.
+#   Formula: env[t] = 0.5 * (1 - cos(pi * t / attack_samples))
+SOUND_ATTACK  = 0.012
+#
+# SOUND_RELEASE — fade-out time in seconds.
+#   Same raised-cosine shape applied in reverse at note end.
+#   Longer release = smoother, more piano-like tail.
+SOUND_RELEASE = 0.060
+#
+# HARMONIC_BLEND — amount of subtle 2nd harmonic (octave above) mixed in.
+#   0.0 = pure sine (very clean). 0.08 = a touch of warmth without buzz.
+#   The 2nd harmonic is also a sine, so it adds warmth without harshness.
+#   Formula: wave = sin(2pi*f*t) + HARMONIC_BLEND * sin(4pi*f*t)
+HARMONIC_BLEND = 0.08
+#
+# MAX_VOICES — maximum simultaneous oscillators before oldest are culled.
+#   Prevents CPU overload when many comparisons fire at once (e.g. bubble sort).
+MAX_VOICES = 24
+#
+# VOICE_STEAL_FADE — when MAX_VOICES is exceeded, stolen voices get this many
+#   samples to fade to zero before being removed (avoids clicks on cull).
+VOICE_STEAL_FADE = 64
 
 # JSON file saved next to the script for autoloading custom sorters
 _SCRIPT_DIR   = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +129,6 @@ _custom_generators: dict = {}
 # ============================================================
 
 def _save_autoload_json():
-    """Write the current list of custom sorter paths to disk."""
     paths = [info["path"] for info in _custom_generators.values() if "path" in info]
     try:
         with open(AUTOLOAD_JSON, "w") as f:
@@ -117,25 +148,73 @@ def _read_autoload_json() -> list:
 # ============================================================
 # ====================== SOUND ENGINE ========================
 # ============================================================
+#
+# HOW THE SILKY SINE ENGINE WORKS
+# ================================
+#
+# Each note trigger creates an _Osc (oscillator) object.
+# Per chunk, all active oscillators are mixed together into one buffer.
+#
+# WAVEFORM — pure sine + tiny 2nd harmonic (both sines):
+#   phase advances by (freq / sample_rate) each sample.
+#   wave[t] = sin(2pi * phase[t]) + HARMONIC_BLEND * sin(4pi * phase[t])
+#   Using numpy: np.sin(TWO_PI * phases) + HARMONIC_BLEND * np.sin(TWO_PI * 2 * phases)
+#
+# ENVELOPE — raised-cosine (Hann) shape for attack and release:
+#   Attack:  env[t] = 0.5 * (1 - cos(pi * t / A))         t in [0, A)
+#   Sustain: env[t] = 1.0                                   t in [A, max_age - R)
+#   Release: env[t] = 0.5 * (1 + cos(pi * (t-start) / R))  t in [max_age-R, max_age)
+#   This is smoother than a linear ramp and eliminates clicking entirely.
+#
+# VOICE STEALING — when MAX_VOICES is exceeded:
+#   The oldest oscillator is flagged for "early release" — its remaining
+#   life is clamped to VOICE_STEAL_FADE samples. The raised-cosine release
+#   still applies, so the stolen note fades cleanly with no click.
+#
+# NORMALIZATION — total output is divided by sqrt(n_voices) (RMS-aware),
+#   which keeps perceived loudness roughly constant regardless of how many
+#   voices are playing at once. Pure /n gives too-quiet results with few voices;
+#   sqrt splits the difference perceptually.
+
+TWO_PI = 2.0 * math.pi
+
 
 class _Osc:
+    """
+    Single oscillator voice.
+
+    Attributes
+    ----------
+    freq      : float  — frequency in Hz
+    phase     : float  — current phase in [0, 1), advances by freq/sr each sample
+    age       : int    — samples rendered so far
+    max_age   : int    — total lifetime in samples
+    attack    : int    — attack length in samples (raised-cosine fade-in)
+    release   : int    — release length in samples (raised-cosine fade-out)
+    """
     __slots__ = ('freq', 'phase', 'age', 'max_age', 'attack', 'release')
+
     def __init__(self, freq, max_age, attack, release):
-        self.freq = freq; self.phase = 0.0; self.age = 0
-        self.max_age = max_age; self.attack = attack; self.release = release
+        self.freq    = freq
+        self.phase   = 0.0
+        self.age     = 0
+        self.max_age = max_age
+        self.attack  = attack
+        self.release = release
+
 
 class SoundEngine:
     def __init__(self):
-        self.sample_rate = SAMPLE_RATE
-        self.chunk_size  = CHUNK_SIZE
-        self.sustain_smp = int(SOUND_SUSTAIN * SAMPLE_RATE)
-        self.attack_smp  = max(1, int(0.004 * SAMPLE_RATE))
-        self.release_smp = max(1, int(0.020 * SAMPLE_RATE))
-        self._oscs       = []
-        self._lock       = threading.Lock()
-        self._running    = False
-        self._thread     = None
-        self._channel    = None
+        self.sample_rate  = SAMPLE_RATE
+        self.chunk_size   = CHUNK_SIZE
+        self.sustain_smp  = int(SOUND_SUSTAIN  * SAMPLE_RATE)
+        self.attack_smp   = max(1, int(SOUND_ATTACK  * SAMPLE_RATE))
+        self.release_smp  = max(1, int(SOUND_RELEASE * SAMPLE_RATE))
+        self._oscs        = []          # list of active _Osc instances
+        self._lock        = threading.Lock()
+        self._running     = False
+        self._thread      = None
+        self._channel     = None
 
     def start(self):
         self._channel = pygame.mixer.Channel(1)
@@ -145,54 +224,124 @@ class SoundEngine:
 
     def stop(self):
         self._running = False
-        if self._channel: self._channel.stop()
+        if self._channel:
+            self._channel.stop()
 
     def trigger(self, value: int, max_value: int):
+        """
+        Fire a new note for the given array value.
+        Maps value -> frequency linearly in [FREQ_LOW, FREQ_HIGH].
+        If we're at MAX_VOICES, the oldest voice is voice-stolen.
+        """
         ratio = value / max_value
         freq  = FREQ_LOW + ratio * (FREQ_HIGH - FREQ_LOW)
         osc   = _Osc(freq, self.sustain_smp, self.attack_smp, self.release_smp)
-        with self._lock: self._oscs.append(osc)
+        with self._lock:
+            # Voice steal: clamp oldest oscillator to a fast fade-out
+            if len(self._oscs) >= MAX_VOICES:
+                oldest = self._oscs[0]
+                steal_release   = min(VOICE_STEAL_FADE, oldest.release)
+                oldest.max_age  = oldest.age + steal_release
+                oldest.release  = steal_release
+            self._oscs.append(osc)
 
     def _gen_chunk(self) -> np.ndarray:
+        """
+        Synthesise one chunk of audio and return it as a float64 array.
+
+        Step-by-step per oscillator:
+          1. Compute per-sample phase array (vectorised with numpy)
+          2. Compute sine wave + optional 2nd harmonic
+          3. Compute raised-cosine envelope (attack / sustain / release)
+          4. Accumulate wave * envelope into the output buffer
+          5. Advance oscillator state (phase, age)
+          6. Remove finished oscillators
+        """
         buf = np.zeros(self.chunk_size, dtype=np.float64)
+        # Local sample indices within this chunk: [0, 1, 2, ..., CHUNK_SIZE-1]
         idx = np.arange(self.chunk_size, dtype=np.float64)
+
         with self._lock:
             alive = []
             for o in self._oscs:
+                # Absolute sample age for each position in this chunk
                 abs_age = idx + o.age
-                phases  = (o.phase + idx * (o.freq / self.sample_rate)) % 1.0
-                wave    = 2.0 * np.abs(2.0 * phases - 1.0) - 1.0
-                env     = np.ones(self.chunk_size)
-                a_mask  = abs_age < o.attack
-                env[a_mask] = abs_age[a_mask] / o.attack
-                rel_start   = o.max_age - o.release
-                r_mask      = abs_age >= rel_start
-                env[r_mask] = np.maximum(0.0, (o.max_age - abs_age[r_mask]) / o.release)
+
+                # ---- WAVEFORM ----
+                # Phase at each sample: (current_phase + sample_offset * freq/sr) mod 1
+                phases = (o.phase + idx * (o.freq / self.sample_rate)) % 1.0
+                # Pure sine (phase in [0,1] maps to angle in [0, 2pi])
+                wave = np.sin(TWO_PI * phases)
+                # Subtle 2nd harmonic — still a sine, adds warmth not buzz
+                if HARMONIC_BLEND > 0.0:
+                    wave += HARMONIC_BLEND * np.sin(TWO_PI * 2.0 * phases)
+
+                # ---- ENVELOPE ----
+                env = np.ones(self.chunk_size, dtype=np.float64)
+
+                # Attack: raised-cosine fade-in
+                #   env = 0.5 * (1 - cos(pi * t / A))
+                #   At t=0: env=0, at t=A: env=1 — smooth, click-free onset
+                a_mask = abs_age < o.attack
+                if np.any(a_mask):
+                    env[a_mask] = 0.5 * (1.0 - np.cos(math.pi * abs_age[a_mask] / o.attack))
+
+                # Release: raised-cosine fade-out (mirror of attack)
+                #   env = 0.5 * (1 + cos(pi * (t - rel_start) / R))
+                #   At t=rel_start: env=1, at t=max_age: env=0 — smooth tail
+                rel_start = o.max_age - o.release
+                r_mask = abs_age >= rel_start
+                if np.any(r_mask):
+                    env[r_mask] = 0.5 * (1.0 + np.cos(
+                        math.pi * (abs_age[r_mask] - rel_start) / o.release
+                    ))
+                    env[r_mask] = np.maximum(0.0, env[r_mask])
+
+                # Zero out anything past the end (safety net)
                 env[abs_age >= o.max_age] = 0.0
+
                 buf += wave * env
-                o.phase = (o.phase + self.chunk_size * o.freq / self.sample_rate) % 1.0
+
+                # Advance oscillator state for next chunk
+                o.phase = (o.phase + self.chunk_size * (o.freq / self.sample_rate)) % 1.0
                 o.age  += self.chunk_size
-                if o.age < o.max_age: alive.append(o)
+
+                if o.age < o.max_age:
+                    alive.append(o)
+
             self._oscs = alive
-            n = max(1, len(alive))
-        buf /= (1.0 + n * 0.40)
+            n_voices = max(1, len(alive))
+
+        # RMS-aware normalisation: divide by sqrt(n) keeps perceived loudness stable
+        # (pure /n is too quiet with few voices; sqrt is a perceptual sweet spot)
+        buf /= math.sqrt(n_voices) * (1.0 + HARMONIC_BLEND)
         return buf
 
     def _loop(self):
+        """
+        Audio thread: generates chunks and queues them to the pygame mixer channel.
+        Runs slightly ahead of playback to avoid gaps (queue up to 4 chunks).
+        """
         chunk_secs = self.chunk_size / self.sample_rate
         while self._running:
             mono   = self._gen_chunk()
+            # Convert float [-1,1] to int16, scale to 85% of max for headroom
             pcm    = (np.clip(mono, -1.0, 1.0) * 32767 * 0.85).astype(np.int16)
+            # Duplicate mono to stereo (L/R identical)
             stereo = np.column_stack((pcm, pcm))
             snd    = pygame.mixer.Sound(buffer=stereo.tobytes())
             deadline = time.monotonic() + chunk_secs * 4
             while self._channel.get_queue() is not None and self._running:
                 time.sleep(0.001)
-                if time.monotonic() > deadline: break
-            if self._running: self._channel.queue(snd)
+                if time.monotonic() > deadline:
+                    break
+            if self._running:
+                self._channel.queue(snd)
             time.sleep(chunk_secs * 0.75)
 
+
 _engine: SoundEngine | None = None
+
 
 def init_sound():
     global _engine
@@ -201,12 +350,23 @@ def init_sound():
     _engine = SoundEngine()
     _engine.start()
 
+
 def stop_sound():
     global _engine
-    if _engine: _engine.stop(); _engine = None
+    if _engine:
+        _engine.stop()
+        _engine = None
+
 
 def trigger_tone(value: int, max_value: int):
-    if _engine and ENABLE_SOUND: _engine.trigger(value, max_value)
+    global _last_trigger_time
+    if not (_engine and ENABLE_SOUND):
+        return
+    now = time.monotonic()
+    if now - _last_trigger_time >= TRIGGER_MIN_INTERVAL:
+        _engine.trigger(value, max_value)
+        _last_trigger_time = now
+
 
 # ============================================================
 # ======================= COLOR / DRAW =======================
@@ -480,19 +640,11 @@ def autoload_custom_sorters():
                     ALGORITHMS.append((name, key))
 
 def load_sortpack(zip_path):
-    """
-    Load a .zip SortPack containing multiple custom sorter .py files,
-    including those inside nested folders.
-    Returns list of (name, key) for successfully loaded sorters.
-    """
     loaded = []
     try:
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Extract everything
             with zipfile.ZipFile(zip_path, 'r') as zf:
                 zf.extractall(tmpdir)
-
-            # Walk recursively
             for root, dirs, files in os.walk(tmpdir):
                 for fname in files:
                     if fname.endswith(".py"):
@@ -503,17 +655,14 @@ def load_sortpack(zip_path):
                             loaded.append((name, key))
     except Exception as e:
         print(f"SortPack load error: {e}")
-
     return loaded
 
-# Roaming folder path
 if sys.platform == "win32":
     APPDATA = os.getenv("APPDATA") or os.path.expanduser("~\\AppData\\Roaming")
     SORTPACK_DIR = os.path.join(APPDATA, "SuperSorter", "SortPacks")
 else:
     SORTPACK_DIR = os.path.expanduser("~/.supersorter/sortpacks")
 
-# Make sure it exists
 os.makedirs(SORTPACK_DIR, exist_ok=True)
 
 # ============================================================
@@ -527,16 +676,14 @@ BTN_GAP = 5
 COL_GAP = 8
 PAD     = 16
 GRID_W  = COLS * BTN_W + (COLS-1) * COL_GAP
-RX      = PAD + GRID_W + 18          # right panel X
-RW      = WINDOW_WIDTH - RX - PAD    # right panel width
+RX      = PAD + GRID_W + 18
+RW      = WINDOW_WIDTH - RX - PAD
 
-# Right panel fixed Y anchors
 _Y_SETTINGS = 88
 _Y_SIZE     = 108
 _Y_SPEED    = 162
-_Y_FREQ     = 216   # FreqRangeSlider top (height = 52px -> bottom ~268)
-_Y_RADIX    = 284   # shown only when radix selected (height ~48 -> bottom ~332)
-# Sound button and below are dynamic (see draw())
+_Y_FREQ     = 216
+_Y_RADIX    = 284
 
 # ============================================================
 # ========================= UI WIDGETS =======================
@@ -544,7 +691,7 @@ _Y_RADIX    = 284   # shown only when radix selected (height ~48 -> bottom ~332)
 
 class Slider:
     """Single-knob slider with snapping and smaller knob."""
-    KNOB_RADIUS = 6  # Smaller radius to avoid overlap
+    KNOB_RADIUS = 6
 
     def __init__(self, x, y, w, lo, hi, val, label, is_int=False, snap=None):
         self.x, self.y, self.w = x, y, w
@@ -553,7 +700,7 @@ class Slider:
         self.label = label
         self.is_int = is_int
         self.drag = False
-        self.snap = snap  # snapping step, e.g., 0.25 for speed
+        self.snap = snap
         self.track = pygame.Rect(x, y+18, w, 4)
         self.hit = pygame.Rect(x-5, y, w+10, 38)
 
@@ -588,9 +735,8 @@ class Slider:
         kx, ky = self._kx(), self.track.centery
         pygame.draw.circle(s, UI_PANEL2, (kx, ky), self.KNOB_RADIUS)
         pygame.draw.circle(s, UI_ACCENT, (kx, ky), self.KNOB_RADIUS, 2)
-        pygame.draw.circle(s, UI_ACCENT, (kx, ky), 2)  # inner dot
+        pygame.draw.circle(s, UI_ACCENT, (kx, ky), 2)
 
-# ---------------------------
 
 class FreqRangeSlider:
     """Dual-knob frequency slider with snap and smaller knobs."""
@@ -645,19 +791,14 @@ class FreqRangeSlider:
     def draw(self, s, fonts):
         tx, ty, tw = self.track.x, self.track.y, self.track.width
         lx, hx = self.lo_x, self.hi_x
-        # Track
         pygame.draw.rect(s, UI_BORDER, self.track, border_radius=2)
-        # Dead zone
         if lx > tx:
             pygame.draw.rect(s, (20,15,28), pygame.Rect(tx, ty-2, lx-tx, 8))
-        # Active band
         if hx > lx: pygame.draw.rect(s, UI_ACCENT, (lx, ty, hx-lx, 4))
-        # Knobs
         for kx2 in (lx, hx):
             pygame.draw.circle(s, UI_PANEL2, (kx2, ty+2), self.KNOB_RADIUS)
             pygame.draw.circle(s, UI_ACCENT, (kx2, ty+2), self.KNOB_RADIUS, 2)
             pygame.draw.circle(s, UI_ACCENT, (kx2, ty+2), 2)
-        # Labels
         lbl  = fonts['small'].render("Freq Range", True, UI_SUBTEXT)
         info = fonts['mono_sm'].render(f"Min: {self.lo_val:.0f} Hz   Max: {self.hi_val:.0f} Hz", True, UI_SUBTEXT)
         s.blit(lbl, (self.x, self.y))
@@ -712,12 +853,10 @@ class Menu:
 
         self._build_btns()
 
-        # Sliders
         self.sl_size  = Slider(RX, _Y_SIZE,  RW, 4, MAX_ARRAY_SIZE, 32, "Array Size", is_int=True)
         self.sl_speed = Slider(RX, _Y_SPEED, RW, 0.25, 8.0, 1.0, "Speed")
         self.sl_freq  = FreqRangeSlider(RX, _Y_FREQ, RW, FREQ_LOW, FREQ_HIGH)
 
-        # Radix base buttons (positioned at _Y_RADIX, only drawn when radix selected)
         bases = [2, 4, 8, 10, 16]
         bw2   = (RW - (len(bases)-1)*5) // len(bases)
         self.radix_base = 10
@@ -748,11 +887,10 @@ class Menu:
         self.msg = msg; self.msg_ok = ok
         self.msg_until = pygame.time.get_ticks() + 4000
 
-    # Dynamic Y for sound button: just below freq slider, or below radix section
     def _y_sound(self):
         base = _Y_FREQ + self.sl_freq.height + 10
         if self._is_radix():
-            base = _Y_RADIX + 16 + 26 + 10   # radix label + buttons + gap
+            base = _Y_RADIX + 16 + 26 + 10
         return base
 
     def handle(self, ev):
@@ -774,7 +912,6 @@ class Menu:
                 for sb, base in self.base_btns:
                     if sb.rect.collidepoint(ev.pos): self.radix_base = base
 
-            # sound btn rect is dynamic; check against computed rect
             snd_rect = pygame.Rect(RX, self._y_sound(), RW, 30)
             if snd_rect.collidepoint(ev.pos):
                 self.sound_on = not self.sound_on
@@ -791,7 +928,6 @@ class Menu:
         path = open_file_dialog()
         if not path: return
 
-        # Handle Python sorter
         if path.lower().endswith(".py"):
             result, err = load_custom_sorter(path)
             if err:
@@ -805,21 +941,17 @@ class Menu:
             self.sel = len(ALGORITHMS) - 1
             self._notify(f"Loaded: {name}", ok=True)
 
-        # Handle SortPack ZIP
         elif path.lower().endswith(".zip"):
             try:
                 with zipfile.ZipFile(path, "r") as z:
-                    # Look for a markdown file for SortPack metadata
                     md_files = [f for f in z.namelist() if f.lower().endswith(".txt")]
                     sortpack_name = os.path.splitext(os.path.basename(path))[0]
                     if md_files:
                         md_content = z.read(md_files[0]).decode("utf-8")
-                        # Example: first line could be the SortPack name
                         first_line = md_content.strip().splitlines()[0]
                         if first_line:
                             sortpack_name = first_line.strip()
 
-                    # Extract all .py files to a temp folder
                     temp_dir = os.path.join(_SCRIPT_DIR, "__sortpack_temp__")
                     os.makedirs(temp_dir, exist_ok=True)
                     py_files = [f for f in z.namelist() if f.lower().endswith(".py")]
@@ -845,7 +977,6 @@ class Menu:
         mp = pygame.mouse.get_pos()
         s.fill(UI_BG)
 
-        # Title
         t1 = self.fonts['title'].render("SuperSorter", True, UI_TEXT)
         t2 = self.fonts['title'].render("SuperSorter", True, UI_ACCENT)
         s.blit(t2, (PAD+1, 23)); s.blit(t1, (PAD, 22))
@@ -853,13 +984,10 @@ class Menu:
                (PAD + t1.get_width() + 12, 31))
         pygame.draw.line(s, UI_BORDER, (PAD, 68), (WINDOW_WIDTH-PAD, 68), 1)
 
-        # Algorithm buttons
         for b in self.btns: b.draw(s, self.fonts, b.idx==self.sel, b.idx==self.hov)
 
-        # Load Sorter button (in grid)
         self.load_btn.draw(s, self.fonts, False, self.load_btn.rect.collidepoint(mp))
 
-        # Notification
         now = pygame.time.get_ticks()
         if self.msg and now < self.msg_until:
             col = UI_GREEN if self.msg_ok else (255, 90, 90)
@@ -868,25 +996,21 @@ class Menu:
         elif now >= self.msg_until:
             self.msg = ""
 
-        # Right panel background
         panel = pygame.Rect(RX-10, 76, RW+20, WINDOW_HEIGHT-82)
         pygame.draw.rect(s, UI_PANEL,  panel, border_radius=7)
         pygame.draw.rect(s, UI_BORDER, panel, 1, border_radius=7)
         s.blit(self.fonts['small'].render("SETTINGS", True, UI_SUBTEXT), (RX, _Y_SETTINGS))
 
-        # Sliders
         self.sl_size.draw(s, self.fonts)
         self.sl_speed.draw(s, self.fonts)
         self.sl_freq.draw(s, self.fonts)
 
-        # Radix base — only shown when a radix sort is selected
         if self._is_radix():
             s.blit(self.fonts['small'].render("Radix Base:", True, UI_SUBTEXT),
                    (RX, _Y_RADIX))
             for sb, base in self.base_btns:
                 sb.draw(s, self.fonts, self.radix_base==base, sb.rect.collidepoint(mp))
 
-        # Sound toggle (dynamic Y)
         y_snd = self._y_sound()
         snd_rect = pygame.Rect(RX, y_snd, RW, 30)
         snd_lbl  = "Sound: ON" if self.sound_on else "Sound: OFF"
@@ -899,7 +1023,6 @@ class Menu:
         st = self.fonts['small'].render(snd_lbl, True, fc)
         s.blit(st, st.get_rect(center=snd_rect.center))
 
-        # Selected algo
         nm, _ = ALGORITHMS[self.sel]
         y_sel = y_snd + 38
         s.blit(self.fonts['small'].render("Selected:", True, UI_SUBTEXT), (RX, y_sel))
@@ -907,7 +1030,6 @@ class Menu:
         s.blit(self.fonts['small'].render("ESC during sort returns to menu", True, UI_DIM),
                (RX, y_sel+36))
 
-        # Start button
         sh = self.start_hov
         pygame.draw.rect(s, (240,50,50) if sh else (200,35,35), self.start_rect, border_radius=7)
         pygame.draw.rect(s, (255,90,90) if sh else UI_ACCENT,   self.start_rect, 2, border_radius=7)
@@ -981,7 +1103,6 @@ def main():
     force_top()
     fonts = build_fonts(); clock = pygame.time.Clock()
 
-    # Autoload any previously saved custom sorters
     autoload_custom_sorters()
 
     while True:
