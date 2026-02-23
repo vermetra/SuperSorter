@@ -58,7 +58,7 @@ pip install sounddevice
 Then run:
 
 ```bash
-python supersorter.py
+python supersolver.py
 ```
 
 ---
@@ -214,4 +214,4 @@ Check that your `.py` file defines a `sort(arr)` generator (uses `yield`). Regul
 
 ## License
 
-MIT — do whatever you like with it.
+MIT, do whatever you like with it.
