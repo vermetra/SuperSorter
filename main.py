@@ -3,6 +3,10 @@ import random
 import numpy as np
 import sys
 import math
+import threading
+import time
+import importlib.util
+import os
 
 try:
     import ctypes
@@ -10,23 +14,35 @@ try:
 except ImportError:
     HAS_CTYPES = False
 
+# tkinter for file dialog (stdlib)
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    HAS_TK = True
+except ImportError:
+    HAS_TK = False
+
 # ============================================================
 # ===================== USER SETTINGS ========================
 # ============================================================
 
-WINDOW_WIDTH  = 1100
-WINDOW_HEIGHT = 680
+WINDOW_WIDTH   = 1100
+WINDOW_HEIGHT  = 680
 MAX_ARRAY_SIZE = 128
-FPS = 120
+FPS            = 120
 
 BACKGROUND_COLOR = (5, 5, 10)
 ACTIVE_COLOR     = (255, 60, 60)
 BAR_SPACING      = 1
 
-ENABLE_SOUND   = True
-MIN_FREQUENCY  = 60
-MAX_FREQUENCY  = 900
-SOUND_DURATION = 0.025
+ENABLE_SOUND  = True
+FREQ_LOW      = 120.0    # default min (user-adjustable)
+FREQ_HIGH     = 1212.0   # default max (user-adjustable)
+FREQ_ABS_LOW  = 12.0     # absolute slider floor
+FREQ_ABS_HIGH = 4800.0   # absolute slider ceiling
+SOUND_SUSTAIN = 0.10
+SAMPLE_RATE   = 44100
+CHUNK_SIZE    = 512
 
 # ============================================================
 # ========================= UI THEME =========================
@@ -43,75 +59,151 @@ UI_SEL_BG     = (50,  12,  12)
 UI_BORDER     = (38,  38,  58)
 UI_SEL_BORDER = (255, 55,  55)
 UI_DIM        = (60,  60,  80)
+UI_HATCH      = (50,  40,  55)   # hatched dead-zone colour
 
 ALGORITHMS = [
-    ("Bubble Sort",       "bubble"),
-    ("Insertion Sort",    "insertion"),
-    ("Selection Sort",    "selection"),
-    ("Quick Sort",        "quick"),
-    ("Merge Sort",        "merge"),
-    ("Heap Sort",         "heap"),
-    ("Shell Sort",        "shell"),
-    ("Cocktail Shaker",   "cocktail"),
-    ("Gnome Sort",        "gnome"),
-    ("Comb Sort",         "comb"),
-    ("Cycle Sort",        "cycle"),
-    ("Pancake Sort",      "pancake"),
-    ("Odd-Even Sort",     "oddeven"),
-    ("LSD Radix Sort",    "lsd_radix"),
-    ("MSD Radix Sort",    "msd_radix"),
+    ("Bubble Sort",     "bubble"),
+    ("Insertion Sort",  "insertion"),
+    ("Selection Sort",  "selection"),
+    ("Quick Sort",      "quick"),
+    ("Merge Sort",      "merge"),
+    ("Heap Sort",       "heap"),
+    ("Shell Sort",      "shell"),
+    ("Cocktail Shaker", "cocktail"),
+    ("Gnome Sort",      "gnome"),
+    ("Comb Sort",       "comb"),
+    ("Cycle Sort",      "cycle"),
+    ("Pancake Sort",    "pancake"),
+    ("Odd-Even Sort",   "oddeven"),
+    ("LSD Radix Sort",  "lsd_radix"),
+    ("MSD Radix Sort",  "msd_radix"),
 ]
 
+# Custom-loaded algorithms are appended here at runtime:
+# ("Custom: filename", "custom_N")
+_custom_generators: dict = {}   # key -> callable(arr)
+
 # ============================================================
-# ======================= SOUND SYSTEM =======================
+# ============== SoS-STYLE SOUND ENGINE ======================
 # ============================================================
 
-def play_tone(value, max_value):
-    if not ENABLE_SOUND:
-        return
-    sample_rate = 44100
-    frequency = MIN_FREQUENCY + ((value / max_value) * (MAX_FREQUENCY - MIN_FREQUENCY))
-    t = np.linspace(0, SOUND_DURATION, int(sample_rate * SOUND_DURATION), endpoint=False)
-    wave = np.sin(2 * np.pi * frequency * t)
-    fade_len = int(0.005 * sample_rate)
-    envelope = np.ones_like(wave)
-    envelope[:fade_len]  = np.linspace(0, 1, fade_len)
-    envelope[-fade_len:] = np.linspace(1, 0, fade_len)
-    wave *= envelope
-    mono   = (wave * 32767).astype(np.int16)
-    stereo = np.column_stack((mono, mono))
-    sound  = pygame.mixer.Sound(buffer=stereo.tobytes())
-    sound.play()
+class _Osc:
+    __slots__ = ('freq', 'phase', 'age', 'max_age', 'attack', 'release')
+    def __init__(self, freq, max_age, attack, release):
+        self.freq = freq; self.phase = 0.0; self.age = 0
+        self.max_age = max_age; self.attack = attack; self.release = release
+
+
+class SoundEngine:
+    def __init__(self):
+        self.sample_rate  = SAMPLE_RATE
+        self.chunk_size   = CHUNK_SIZE
+        self.sustain_smp  = int(SOUND_SUSTAIN * SAMPLE_RATE)
+        self.attack_smp   = max(1, int(0.004 * SAMPLE_RATE))
+        self.release_smp  = max(1, int(0.020 * SAMPLE_RATE))
+        self._oscs        = []
+        self._lock        = threading.Lock()
+        self._running     = False
+        self._thread      = None
+        self._channel     = None
+
+    def start(self):
+        self._channel = pygame.mixer.Channel(1)
+        self._running = True
+        self._thread  = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        if self._channel: self._channel.stop()
+
+    def trigger(self, value: int, max_value: int):
+        ratio = value / max_value
+        freq  = FREQ_LOW + ratio * (FREQ_HIGH - FREQ_LOW)
+        osc   = _Osc(freq, self.sustain_smp, self.attack_smp, self.release_smp)
+        with self._lock: self._oscs.append(osc)
+
+    def set_sustain(self, seconds: float):
+        self.sustain_smp = int(seconds * self.sample_rate)
+
+    def _gen_chunk(self) -> np.ndarray:
+        buf = np.zeros(self.chunk_size, dtype=np.float64)
+        idx = np.arange(self.chunk_size, dtype=np.float64)
+        with self._lock:
+            alive = []
+            for o in self._oscs:
+                abs_age = idx + o.age
+                phases  = (o.phase + idx * (o.freq / self.sample_rate)) % 1.0
+                wave    = 2.0 * np.abs(2.0 * phases - 1.0) - 1.0
+                env     = np.ones(self.chunk_size)
+                a_mask  = abs_age < o.attack
+                env[a_mask] = abs_age[a_mask] / o.attack
+                rel_start   = o.max_age - o.release
+                r_mask      = abs_age >= rel_start
+                env[r_mask] = np.maximum(0.0, (o.max_age - abs_age[r_mask]) / o.release)
+                env[abs_age >= o.max_age] = 0.0
+                buf += wave * env
+                o.phase = (o.phase + self.chunk_size * o.freq / self.sample_rate) % 1.0
+                o.age  += self.chunk_size
+                if o.age < o.max_age: alive.append(o)
+            self._oscs = alive
+            n = max(1, len(alive))
+        buf /= (1.0 + n * 0.40)
+        return buf
+
+    def _loop(self):
+        chunk_secs = self.chunk_size / self.sample_rate
+        while self._running:
+            mono   = self._gen_chunk()
+            pcm    = (np.clip(mono, -1.0, 1.0) * 32767 * 0.85).astype(np.int16)
+            stereo = np.column_stack((pcm, pcm))
+            snd    = pygame.mixer.Sound(buffer=stereo.tobytes())
+            deadline = time.monotonic() + chunk_secs * 4
+            while self._channel.get_queue() is not None and self._running:
+                time.sleep(0.001)
+                if time.monotonic() > deadline: break
+            if self._running: self._channel.queue(snd)
+            time.sleep(chunk_secs * 0.75)
+
+
+_engine: SoundEngine | None = None
+
+def init_sound():
+    global _engine
+    pygame.mixer.pre_init(SAMPLE_RATE, -16, 2, CHUNK_SIZE)
+    pygame.mixer.init()
+    _engine = SoundEngine()
+    _engine.start()
+
+def stop_sound():
+    global _engine
+    if _engine: _engine.stop(); _engine = None
+
+def trigger_tone(value: int, max_value: int):
+    if _engine and ENABLE_SOUND: _engine.trigger(value, max_value)
 
 # ============================================================
 # ======================= COLOR / DRAW =======================
 # ============================================================
 
 def value_to_color(value, max_value):
-    ratio = value / max_value
-    if ratio < 0.25:
-        return (0, int(255 * ratio * 4), 255)
-    elif ratio < 0.5:
-        return (0, 255, int(255 * (1 - (ratio - 0.25) * 4)))
-    elif ratio < 0.75:
-        return (int(255 * (ratio - 0.5) * 4), 255, 0)
-    else:
-        return (255, int(255 * (1 - (ratio - 0.75) * 4)), 0)
+    r = value / max_value
+    if r < 0.25: return (0, int(255 * r * 4), 255)
+    if r < 0.5:  return (0, 255, int(255 * (1 - (r - 0.25) * 4)))
+    if r < 0.75: return (int(255 * (r - 0.5) * 4), 255, 0)
+    return (255, int(255 * (1 - (r - 0.75) * 4)), 0)
 
 def draw_bars(screen, array, active_indices, label=""):
     screen.fill(BACKGROUND_COLOR)
-    n = len(array)
-    bar_width = WINDOW_WIDTH / n
-    for idx, val in enumerate(array):
-        x      = idx * bar_width
-        height = (val / n) * (WINDOW_HEIGHT - 60)
-        color  = ACTIVE_COLOR if idx in active_indices else value_to_color(val, n)
-        pygame.draw.rect(screen, color,
-                         (x, WINDOW_HEIGHT - height, bar_width - BAR_SPACING, height))
+    n  = len(array)
+    bw = WINDOW_WIDTH / n
+    for i, v in enumerate(array):
+        h = (v / n) * (WINDOW_HEIGHT - 60)
+        c = ACTIVE_COLOR if i in active_indices else value_to_color(v, n)
+        pygame.draw.rect(screen, c, (i * bw, WINDOW_HEIGHT - h, bw - BAR_SPACING, h))
     if label:
-        font = pygame.font.SysFont("consolas", 18)
-        surf = font.render(label, True, (140, 140, 160))
-        screen.blit(surf, (12, 10))
+        f = pygame.font.SysFont("consolas", 18)
+        screen.blit(f.render(label, True, (140, 140, 160)), (12, 10))
     pygame.display.flip()
 
 # ============================================================
@@ -123,265 +215,166 @@ def bubble_sort(arr):
     for i in range(n):
         for j in range(n - i - 1):
             yield arr, [j, j + 1]
-            if arr[j] > arr[j + 1]:
-                arr[j], arr[j + 1] = arr[j + 1], arr[j]
-                yield arr, [j, j + 1]
+            if arr[j] > arr[j + 1]: arr[j], arr[j+1] = arr[j+1], arr[j]; yield arr, [j, j+1]
 
 def insertion_sort(arr):
     for i in range(1, len(arr)):
-        key = arr[i]
-        j = i - 1
+        key = arr[i]; j = i - 1
         while j >= 0 and arr[j] > key:
-            yield arr, [j, j + 1]
-            arr[j + 1] = arr[j]
-            j -= 1
-            yield arr, [j + 1]
-        arr[j + 1] = key
-        yield arr, [j + 1]
+            yield arr, [j, j+1]; arr[j+1] = arr[j]; j -= 1; yield arr, [j+1]
+        arr[j+1] = key; yield arr, [j+1]
 
 def selection_sort(arr):
     n = len(arr)
     for i in range(n):
-        min_idx = i
-        for j in range(i + 1, n):
-            yield arr, [min_idx, j]
-            if arr[j] < arr[min_idx]:
-                min_idx = j
-                yield arr, [min_idx]
-        arr[i], arr[min_idx] = arr[min_idx], arr[i]
-        yield arr, [i, min_idx]
+        mi = i
+        for j in range(i+1, n):
+            yield arr, [mi, j]
+            if arr[j] < arr[mi]: mi = j; yield arr, [mi]
+        arr[i], arr[mi] = arr[mi], arr[i]; yield arr, [i, mi]
 
 def quick_sort(arr):
-    def _quick(lo, hi):
-        if lo >= hi:
-            return
-        pivot = arr[hi]
-        i = lo - 1
+    def _q(lo, hi):
+        if lo >= hi: return
+        pivot = arr[hi]; i = lo - 1
         for j in range(lo, hi):
             yield arr, [j, hi]
-            if arr[j] <= pivot:
-                i += 1
-                arr[i], arr[j] = arr[j], arr[i]
-                yield arr, [i, j]
-        arr[i + 1], arr[hi] = arr[hi], arr[i + 1]
-        yield arr, [i + 1, hi]
-        yield from _quick(lo, i)
-        yield from _quick(i + 2, hi)
-    yield from _quick(0, len(arr) - 1)
+            if arr[j] <= pivot: i += 1; arr[i], arr[j] = arr[j], arr[i]; yield arr, [i, j]
+        arr[i+1], arr[hi] = arr[hi], arr[i+1]; yield arr, [i+1, hi]
+        yield from _q(lo, i); yield from _q(i+2, hi)
+    yield from _q(0, len(arr)-1)
 
 def merge_sort(arr):
-    def _merge(lo, mid, hi):
-        left  = arr[lo:mid + 1]
-        right = arr[mid + 1:hi + 1]
-        i = j = 0
-        k = lo
-        while i < len(left) and j < len(right):
-            yield arr, [lo + i, mid + 1 + j]
-            if left[i] <= right[j]:
-                arr[k] = left[i]; i += 1
-            else:
-                arr[k] = right[j]; j += 1
-            yield arr, [k]
-            k += 1
-        while i < len(left):
-            arr[k] = left[i]; yield arr, [k]; i += 1; k += 1
-        while j < len(right):
-            arr[k] = right[j]; yield arr, [k]; j += 1; k += 1
-
+    def _m(lo, mid, hi):
+        L = arr[lo:mid+1][:]; R = arr[mid+1:hi+1][:]
+        i = j = 0; k = lo
+        while i < len(L) and j < len(R):
+            yield arr, [lo+i, mid+1+j]
+            if L[i] <= R[j]: arr[k] = L[i]; i += 1
+            else:             arr[k] = R[j]; j += 1
+            yield arr, [k]; k += 1
+        while i < len(L): arr[k] = L[i]; yield arr, [k]; i += 1; k += 1
+        while j < len(R): arr[k] = R[j]; yield arr, [k]; j += 1; k += 1
     def _ms(lo, hi):
         if lo < hi:
-            mid = (lo + hi) // 2
-            yield from _ms(lo, mid)
-            yield from _ms(mid + 1, hi)
-            yield from _merge(lo, mid, hi)
-    yield from _ms(0, len(arr) - 1)
+            mid = (lo+hi)//2; yield from _ms(lo, mid); yield from _ms(mid+1, hi)
+            yield from _m(lo, mid, hi)
+    yield from _ms(0, len(arr)-1)
 
 def heap_sort(arr):
-    def heapify(n, i):
-        largest, l, r = i, 2 * i + 1, 2 * i + 2
-        if l < n and arr[l] > arr[largest]: largest = l
-        if r < n and arr[r] > arr[largest]: largest = r
-        if largest != i:
-            arr[i], arr[largest] = arr[largest], arr[i]
-            yield arr, [i, largest]
-            yield from heapify(n, largest)
-        else:
-            yield arr, [i]
-
+    def hfy(n, i):
+        lg, l, r = i, 2*i+1, 2*i+2
+        if l < n and arr[l] > arr[lg]: lg = l
+        if r < n and arr[r] > arr[lg]: lg = r
+        if lg != i: arr[i], arr[lg] = arr[lg], arr[i]; yield arr, [i, lg]; yield from hfy(n, lg)
+        else: yield arr, [i]
     n = len(arr)
-    for i in range(n // 2 - 1, -1, -1):
-        yield from heapify(n, i)
-    for i in range(n - 1, 0, -1):
-        arr[0], arr[i] = arr[i], arr[0]
-        yield arr, [0, i]
-        yield from heapify(i, 0)
+    for i in range(n//2-1, -1, -1): yield from hfy(n, i)
+    for i in range(n-1, 0, -1): arr[0], arr[i] = arr[i], arr[0]; yield arr, [0, i]; yield from hfy(i, 0)
 
 def shell_sort(arr):
-    n, gap = len(arr), len(arr) // 2
+    n, gap = len(arr), len(arr)//2
     while gap > 0:
         for i in range(gap, n):
-            temp = arr[i]
-            j = i
-            while j >= gap and arr[j - gap] > temp:
-                yield arr, [j, j - gap]
-                arr[j] = arr[j - gap]
-                j -= gap
-            arr[j] = temp
-            yield arr, [j]
+            t = arr[i]; j = i
+            while j >= gap and arr[j-gap] > t: yield arr, [j, j-gap]; arr[j] = arr[j-gap]; j -= gap
+            arr[j] = t; yield arr, [j]
         gap //= 2
 
 def cocktail_sort(arr):
-    lo, hi = 0, len(arr) - 1
+    lo, hi = 0, len(arr)-1
     while lo < hi:
         for i in range(lo, hi):
-            yield arr, [i, i + 1]
-            if arr[i] > arr[i + 1]:
-                arr[i], arr[i + 1] = arr[i + 1], arr[i]
-                yield arr, [i, i + 1]
+            yield arr, [i, i+1]
+            if arr[i] > arr[i+1]: arr[i], arr[i+1] = arr[i+1], arr[i]; yield arr, [i, i+1]
         hi -= 1
         for i in range(hi, lo, -1):
-            yield arr, [i, i - 1]
-            if arr[i] < arr[i - 1]:
-                arr[i], arr[i - 1] = arr[i - 1], arr[i]
-                yield arr, [i, i - 1]
+            yield arr, [i, i-1]
+            if arr[i] < arr[i-1]: arr[i], arr[i-1] = arr[i-1], arr[i]; yield arr, [i, i-1]
         lo += 1
 
 def gnome_sort(arr):
     i = 0
     while i < len(arr):
         yield arr, [i]
-        if i == 0 or arr[i] >= arr[i - 1]:
-            i += 1
-        else:
-            arr[i], arr[i - 1] = arr[i - 1], arr[i]
-            yield arr, [i, i - 1]
-            i -= 1
+        if i == 0 or arr[i] >= arr[i-1]: i += 1
+        else: arr[i], arr[i-1] = arr[i-1], arr[i]; yield arr, [i, i-1]; i -= 1
 
 def comb_sort(arr):
-    n, gap, shrink = len(arr), len(arr), 1.3
-    sorted_ = False
-    while not sorted_:
-        gap = int(gap / shrink)
-        if gap <= 1:
-            gap = 1
-            sorted_ = True
-        for i in range(n - gap):
-            yield arr, [i, i + gap]
-            if arr[i] > arr[i + gap]:
-                arr[i], arr[i + gap] = arr[i + gap], arr[i]
-                sorted_ = False
-                yield arr, [i, i + gap]
+    n, gap, shrink = len(arr), len(arr), 1.3; s = False
+    while not s:
+        gap = int(gap/shrink)
+        if gap <= 1: gap = 1; s = True
+        for i in range(n-gap):
+            yield arr, [i, i+gap]
+            if arr[i] > arr[i+gap]: arr[i], arr[i+gap] = arr[i+gap], arr[i]; s = False; yield arr, [i, i+gap]
 
 def cycle_sort(arr):
     n = len(arr)
-    for cs in range(n - 1):
-        item = arr[cs]
-        pos  = cs
-        for i in range(cs + 1, n):
-            yield arr, [i, cs]
-            if arr[i] < item:
-                pos += 1
-        if pos == cs:
-            continue
-        while item == arr[pos]:
-            pos += 1
-        arr[pos], item = item, arr[pos]
-        yield arr, [pos, cs]
+    for cs in range(n-1):
+        item = arr[cs]; pos = cs
+        for i in range(cs+1, n): yield arr, [i, cs]; (pos := pos+1) if arr[i] < item else None
+        if pos == cs: continue
+        while item == arr[pos]: pos += 1
+        arr[pos], item = item, arr[pos]; yield arr, [pos, cs]
         while pos != cs:
             pos = cs
-            for i in range(cs + 1, n):
-                yield arr, [i, cs]
-                if arr[i] < item:
-                    pos += 1
-            while item == arr[pos]:
-                pos += 1
-            arr[pos], item = item, arr[pos]
-            yield arr, [pos]
+            for i in range(cs+1, n): yield arr, [i, cs]; (pos := pos+1) if arr[i] < item else None
+            while item == arr[pos]: pos += 1
+            arr[pos], item = item, arr[pos]; yield arr, [pos]
 
 def pancake_sort(arr):
     def flip(k):
         lo, hi = 0, k
-        while lo < hi:
-            arr[lo], arr[hi] = arr[hi], arr[lo]
-            yield arr, [lo, hi]
-            lo += 1; hi -= 1
-
-    for size in range(len(arr), 1, -1):
-        max_idx = arr.index(max(arr[:size]))
-        if max_idx != size - 1:
-            if max_idx != 0:
-                yield from flip(max_idx)
-            yield from flip(size - 1)
+        while lo < hi: arr[lo], arr[hi] = arr[hi], arr[lo]; yield arr, [lo, hi]; lo += 1; hi -= 1
+    for sz in range(len(arr), 1, -1):
+        mi = arr.index(max(arr[:sz]))
+        if mi != sz-1:
+            if mi != 0: yield from flip(mi)
+            yield from flip(sz-1)
 
 def odd_even_sort(arr):
-    n = len(arr)
-    sorted_ = False
-    while not sorted_:
-        sorted_ = True
-        for i in range(1, n - 1, 2):
-            yield arr, [i, i + 1]
-            if arr[i] > arr[i + 1]:
-                arr[i], arr[i + 1] = arr[i + 1], arr[i]
-                sorted_ = False; yield arr, [i, i + 1]
-        for i in range(0, n - 1, 2):
-            yield arr, [i, i + 1]
-            if arr[i] > arr[i + 1]:
-                arr[i], arr[i + 1] = arr[i + 1], arr[i]
-                sorted_ = False; yield arr, [i, i + 1]
+    n = len(arr); s = False
+    while not s:
+        s = True
+        for i in range(1, n-1, 2):
+            yield arr, [i, i+1]
+            if arr[i] > arr[i+1]: arr[i], arr[i+1] = arr[i+1], arr[i]; s = False; yield arr, [i, i+1]
+        for i in range(0, n-1, 2):
+            yield arr, [i, i+1]
+            if arr[i] > arr[i+1]: arr[i], arr[i+1] = arr[i+1], arr[i]; s = False; yield arr, [i, i+1]
 
-def counting_sort_radix(arr, exp, base):
-    n      = len(arr)
-    output = [0] * n
-    count  = [0] * base
-    for i in range(n):
-        count[(arr[i] // exp) % base] += 1
-        yield arr, [i]
-    for i in range(1, base):
-        count[i] += count[i - 1]
-    for i in range(n - 1, -1, -1):
-        idx = (arr[i] // exp) % base
-        output[count[idx] - 1] = arr[i]
-        count[idx] -= 1
-        yield arr, [i]
-    for i in range(n):
-        arr[i] = output[i]
-        yield arr, [i]
+def _counting_radix(arr, exp, base):
+    n = len(arr); out = [0]*n; cnt = [0]*base
+    for i in range(n): cnt[(arr[i]//exp)%base] += 1; yield arr, [i]
+    for i in range(1, base): cnt[i] += cnt[i-1]
+    for i in range(n-1, -1, -1): idx=(arr[i]//exp)%base; out[cnt[idx]-1]=arr[i]; cnt[idx]-=1; yield arr,[i]
+    for i in range(n): arr[i] = out[i]; yield arr, [i]
 
 def lsd_radix_sort(arr, base=10):
-    max_val, exp = max(arr), 1
-    while max_val // exp > 0:
-        yield from counting_sort_radix(arr, exp, base)
-        exp *= base
+    mv, exp = max(arr), 1
+    while mv//exp > 0: yield from _counting_radix(arr, exp, base); exp *= base
 
 def msd_radix_sort(arr, base=10):
-    def msd_helper(lo, hi, exp):
-        if hi - lo <= 1 or exp == 0:
-            return
-        buckets = [[] for _ in range(base)]
-        for i in range(lo, hi):
-            buckets[(arr[i] // exp) % base].append(arr[i])
-            yield arr, [i]
+    def helper(lo, hi, exp):
+        if hi-lo <= 1 or exp == 0: return
+        bkts = [[] for _ in range(base)]
+        for i in range(lo, hi): bkts[(arr[i]//exp)%base].append(arr[i]); yield arr, [i]
         i = lo
-        for bucket in buckets:
-            for num in bucket:
-                arr[i] = num; i += 1
-            if bucket:
-                yield arr, list(range(i - len(bucket), i))
+        for bk in bkts:
+            for v in bk: arr[i] = v; i += 1
+            if bk: yield arr, list(range(i-len(bk), i))
         i = lo
-        for bucket in buckets:
-            if len(bucket) > 1:
-                yield from msd_helper(i, i + len(bucket), exp // base)
-            i += len(bucket)
+        for bk in bkts:
+            if len(bk) > 1: yield from helper(i, i+len(bk), exp//base)
+            i += len(bk)
+    if not arr: return
+    mv, exp = max(arr), 1
+    while mv//exp >= base: exp *= base
+    yield from helper(0, len(arr), exp)
 
-    if not arr:
-        return
-    max_val, exp = max(arr), 1
-    while max_val // exp >= base:
-        exp *= base
-    yield from msd_helper(0, len(arr), exp)
-
-def get_sort_generator(key, arr, radix_base=10):
-    return {
+def get_generator(key, arr, radix_base):
+    builtins = {
         "bubble":    lambda: bubble_sort(arr),
         "insertion": lambda: insertion_sort(arr),
         "selection": lambda: selection_sort(arr),
@@ -397,368 +390,487 @@ def get_sort_generator(key, arr, radix_base=10):
         "oddeven":   lambda: odd_even_sort(arr),
         "lsd_radix": lambda: lsd_radix_sort(arr, radix_base),
         "msd_radix": lambda: msd_radix_sort(arr, radix_base),
-    }[key]()
+    }
+    if key in builtins: return builtins[key]()
+    if key in _custom_generators: return _custom_generators[key](arr)
+    raise KeyError(f"Unknown algorithm key: {key}")
+
+# ============================================================
+# ===================== CUSTOM SORTER LOADER =================
+# ============================================================
+
+def load_custom_sorter(filepath: str) -> tuple[str, str] | None:
+    """
+    Load a Python file as a custom sorter.
+    The file must define a function:  sort(arr)  ->  generator yielding (arr, [indices])
+    Returns (display_name, key) on success, None on failure.
+    """
+    try:
+        spec   = importlib.util.spec_from_file_location("custom_sort", filepath)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        if not hasattr(module, "sort"):
+            return None, "Missing `sort(arr)` function"
+        fn    = module.sort
+        name  = getattr(module, "NAME", os.path.splitext(os.path.basename(filepath))[0])
+        key   = f"custom_{len(_custom_generators)}"
+        _custom_generators[key] = fn
+        return (f"⚡ {name}", key), None
+    except Exception as e:
+        return None, str(e)
+
+def open_file_dialog() -> str | None:
+    """Open a native file-picker and return chosen path (or None)."""
+    if not HAS_TK:
+        return None
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    path = filedialog.askopenfilename(
+        title="Load Custom Sorter",
+        filetypes=[("Python files", "*.py"), ("All files", "*.*")]
+    )
+    root.destroy()
+    return path if path else None
 
 # ============================================================
 # ========================= UI CLASSES =======================
 # ============================================================
 
 class Slider:
-    def __init__(self, x, y, w, min_val, max_val, initial, label, is_int=False):
+    """Standard single-knob slider."""
+    def __init__(self, x, y, w, lo, hi, val, label, is_int=False):
         self.x, self.y, self.w = x, y, w
-        self.min_val  = min_val
-        self.max_val  = max_val
-        self.value    = initial
-        self.label    = label
-        self.is_int   = is_int
-        self.dragging = False
-        self.track    = pygame.Rect(x, y + 18, w, 5)
-        self.hit_area = pygame.Rect(x - 5, y, w + 10, 42)
+        self.lo, self.hi = lo, hi
+        self.value = val; self.label = label; self.is_int = is_int
+        self.drag  = False
+        self.track = pygame.Rect(x, y+18, w, 5)
+        self.hit   = pygame.Rect(x-5, y, w+10, 42)
 
-    def _ratio(self):
-        return (self.value - self.min_val) / (self.max_val - self.min_val)
+    def _r(self):  return (self.value - self.lo) / (self.hi - self.lo)
+    def _kx(self): return int(self.x + self._r() * self.w)
 
-    def _knob_x(self):
-        return int(self.x + self._ratio() * self.w)
-
-    def handle_event(self, event):
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            kx, ky = self._knob_x(), self.track.centery
-            if math.hypot(event.pos[0] - kx, event.pos[1] - ky) < 14 \
-               or self.hit_area.collidepoint(event.pos):
-                self.dragging = True
-                self._set(event.pos[0])
-        elif event.type == pygame.MOUSEBUTTONUP:
-            self.dragging = False
-        elif event.type == pygame.MOUSEMOTION and self.dragging:
-            self._set(event.pos[0])
+    def handle(self, ev):
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            if math.hypot(ev.pos[0]-self._kx(), ev.pos[1]-self.track.centery) < 14 \
+               or self.hit.collidepoint(ev.pos): self.drag = True; self._set(ev.pos[0])
+        elif ev.type == pygame.MOUSEBUTTONUP: self.drag = False
+        elif ev.type == pygame.MOUSEMOTION and self.drag: self._set(ev.pos[0])
 
     def _set(self, mx):
-        ratio = max(0.0, min(1.0, (mx - self.x) / self.w))
-        raw = self.min_val + ratio * (self.max_val - self.min_val)
+        r = max(0.0, min(1.0, (mx - self.x) / self.w))
+        raw = self.lo + r * (self.hi - self.lo)
         self.value = int(round(raw)) if self.is_int else round(raw * 4) / 4
 
-    def draw(self, screen, fonts):
-        # Label + value
-        val_str = str(self.value) if self.is_int else f"{self.value:.2f}x"
-        lbl = fonts['small'].render(f"{self.label}:  {val_str}", True, UI_SUBTEXT)
-        screen.blit(lbl, (self.x, self.y))
-        # Track background
-        pygame.draw.rect(screen, UI_BORDER, self.track, border_radius=3)
-        # Fill
-        fill_w = int(self._ratio() * self.w)
-        if fill_w > 0:
-            pygame.draw.rect(screen, UI_ACCENT,
-                             (self.x, self.track.y, fill_w, 5), border_radius=3)
-        # Knob
-        kx = self._knob_x()
+    def draw(self, s, fonts):
+        vs = str(self.value) if self.is_int else f"{self.value:.2f}x"
+        s.blit(fonts['small'].render(f"{self.label}:  {vs}", True, UI_SUBTEXT), (self.x, self.y))
+        pygame.draw.rect(s, UI_BORDER, self.track, border_radius=3)
+        fw = int(self._r() * self.w)
+        if fw > 0: pygame.draw.rect(s, UI_ACCENT, (self.x, self.track.y, fw, 5), border_radius=3)
+        kx, ky = self._kx(), self.track.centery
+        pygame.draw.circle(s, UI_PANEL2, (kx, ky), 10)
+        pygame.draw.circle(s, UI_ACCENT, (kx, ky), 10, 2)
+        pygame.draw.circle(s, UI_ACCENT, (kx, ky), 4)
+
+
+class FreqRangeSlider:
+    """
+    Dual-knob frequency range slider matching the sketch:
+      - Left knob  = min freq  (FREQ_LOW)
+      - Right knob = max freq  (FREQ_HIGH)
+      - Hatched fill left of left knob  (dead-zone below min)
+      - Solid accent fill between knobs (active band)
+      - Plain track right of right knob
+    Absolute limits: FREQ_ABS_LOW .. FREQ_ABS_HIGH
+    """
+    KNOB_R    = 10
+    HATCH_GAP = 6    # pixels between hatch lines
+
+    def __init__(self, x, y, w, lo_val, hi_val):
+        self.x, self.y, self.w = x, y, w
+        self.lo_val = lo_val   # current min freq
+        self.hi_val = hi_val   # current max freq
+        self.drag_lo = False
+        self.drag_hi = False
+        self.track   = pygame.Rect(x, y + 22, w, 5)
+        self._hatch_surf = None   # cached
+
+    # --- helpers ---
+    def _to_x(self, freq):
+        r = (freq - FREQ_ABS_LOW) / (FREQ_ABS_HIGH - FREQ_ABS_LOW)
+        return int(self.x + r * self.w)
+
+    def _to_freq(self, px):
+        r = max(0.0, min(1.0, (px - self.x) / self.w))
+        return FREQ_ABS_LOW + r * (FREQ_ABS_HIGH - FREQ_ABS_LOW)
+
+    @property
+    def lo_x(self): return self._to_x(self.lo_val)
+    @property
+    def hi_x(self): return self._to_x(self.hi_val)
+
+    def handle(self, ev):
         ky = self.track.centery
-        pygame.draw.circle(screen, UI_PANEL2, (kx, ky), 10)
-        pygame.draw.circle(screen, UI_ACCENT, (kx, ky), 10, 2)
-        pygame.draw.circle(screen, UI_ACCENT, (kx, ky), 4)
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            lx, hx = self.lo_x, self.hi_x
+            dl = math.hypot(ev.pos[0]-lx, ev.pos[1]-ky)
+            dh = math.hypot(ev.pos[0]-hx, ev.pos[1]-ky)
+            if dl < 14 and dl <= dh: self.drag_lo = True
+            elif dh < 14:            self.drag_hi = True
+        elif ev.type == pygame.MOUSEBUTTONUP:
+            self.drag_lo = self.drag_hi = False
+        elif ev.type == pygame.MOUSEMOTION:
+            if self.drag_lo:
+                f = self._to_freq(ev.pos[0])
+                self.lo_val = max(FREQ_ABS_LOW, min(f, self.hi_val - 10))
+            if self.drag_hi:
+                f = self._to_freq(ev.pos[0])
+                self.hi_val = min(FREQ_ABS_HIGH, max(f, self.lo_val + 10))
+
+    def draw(self, s, fonts):
+        tx, ty = self.track.x, self.track.y
+        tw, th = self.track.width, self.track.height
+        ky     = self.track.centery
+        lx     = self.lo_x
+        hx     = self.hi_x
+
+        # --- label row ---
+        lbl = fonts['small'].render("Freq Range:", True, UI_SUBTEXT)
+        s.blit(lbl, (self.x, self.y))
+
+        lo_lbl = fonts['mono_sm'].render(f"{self.lo_val:.0f} Hz", True, UI_ACCENT)
+        hi_lbl = fonts['mono_sm'].render(f"{self.hi_val:.0f} Hz", True, UI_ACCENT)
+        abs_lo = fonts['mono_sm'].render(f"{FREQ_ABS_LOW:.0f}", True, UI_DIM)
+        abs_hi = fonts['mono_sm'].render(f"{FREQ_ABS_HIGH:.0f}", True, UI_DIM)
+
+        # abs limits
+        s.blit(abs_lo, (self.x,              self.y + 2))
+        s.blit(abs_hi, (self.x + self.w - abs_hi.get_width(), self.y + 2))
+
+        # min/max freq labels above knobs
+        lo_lw = lo_lbl.get_width()
+        hi_lw = hi_lbl.get_width()
+        lo_lx = max(self.x, min(lx - lo_lw//2, self.x + self.w - lo_lw))
+        hi_lx = max(self.x, min(hx - hi_lw//2, self.x + self.w - hi_lw))
+        s.blit(lo_lbl, (lo_lx, self.y + 2))
+        s.blit(hi_lbl, (hi_lx, self.y + 2))
+
+        # --- track base (dark full width) ---
+        pygame.draw.rect(s, UI_BORDER, self.track, border_radius=3)
+
+        # --- hatched dead-zone (left of lo knob) ---
+        # draw diagonal hatch lines clipped to [tx, lx]
+        if lx > tx:
+            clip_rect = pygame.Rect(tx, ty - 2, lx - tx, th + 4)
+            # darker fill first
+            pygame.draw.rect(s, (25, 18, 32), clip_rect)
+            # diagonal hatch lines
+            gap = self.HATCH_GAP
+            span = (lx - tx) + th * 2
+            for off in range(0, span, gap):
+                x1 = tx + off;       y1 = ty + th
+                x2 = tx + off - th;  y2 = ty
+                # clamp to clip_rect
+                x1 = max(tx, min(lx, x1)); x2 = max(tx, min(lx, x2))
+                pygame.draw.line(s, UI_HATCH, (x1, y1), (x2, y2), 1)
+
+        # --- active band fill (between knobs) ---
+        band_w = hx - lx
+        if band_w > 0:
+            pygame.draw.rect(s, UI_ACCENT, (lx, ty, band_w, th))
+
+        # --- knobs ---
+        for kx, is_lo in ((lx, True), (hx, False)):
+            pygame.draw.circle(s, UI_PANEL2, (kx, ky), self.KNOB_R)
+            pygame.draw.circle(s, UI_ACCENT, (kx, ky), self.KNOB_R, 2)
+            pygame.draw.circle(s, UI_ACCENT, (kx, ky), 4)
+
+        # --- abs limit ticks ---
+        for tx2 in (tx, tx + tw):
+            pygame.draw.line(s, UI_DIM, (tx2, ky - 7), (tx2, ky + 7), 1)
 
 
-class AlgoButton:
-    HEIGHT = 44
-    def __init__(self, x, y, w, name, key, index):
-        self.rect  = pygame.Rect(x, y, w, self.HEIGHT)
-        self.name  = name
-        self.key   = key
-        self.index = index
+class AlgoBtn:
+    H = 44
+    def __init__(self, x, y, w, name, key, idx):
+        self.rect = pygame.Rect(x, y, w, self.H)
+        self.name, self.key, self.idx = name, key, idx
 
-    def draw(self, screen, fonts, selected, hovered):
-        bg     = UI_SEL_BG  if selected else (UI_HOVER if hovered else UI_PANEL)
-        border = UI_SEL_BORDER if selected else (UI_DIM if hovered else UI_BORDER)
-        pygame.draw.rect(screen, bg,     self.rect, border_radius=6)
-        pygame.draw.rect(screen, border, self.rect, 1, border_radius=6)
-
-        num_col  = UI_ACCENT  if selected else UI_SUBTEXT
-        name_col = UI_TEXT    if selected else (UI_TEXT if hovered else (160, 160, 180))
-
-        num_surf  = fonts['mono_sm'].render(f"{self.index + 1:02d}", True, num_col)
-        name_surf = fonts['mid'].render(self.name, True, name_col)
-
-        screen.blit(num_surf,  (self.rect.x + 10, self.rect.y + 14))
-        screen.blit(name_surf, (self.rect.x + 42, self.rect.y + 13))
+    def draw(self, s, fonts, sel, hov):
+        bg = UI_SEL_BG if sel else (UI_HOVER if hov else UI_PANEL)
+        br = UI_SEL_BORDER if sel else (UI_DIM if hov else UI_BORDER)
+        pygame.draw.rect(s, bg, self.rect, border_radius=6)
+        pygame.draw.rect(s, br, self.rect, 1, border_radius=6)
+        nc = UI_ACCENT if sel else UI_SUBTEXT
+        tc = UI_TEXT if sel else (UI_TEXT if hov else (160, 160, 180))
+        s.blit(fonts['mono_sm'].render(f"{self.idx+1:02d}", True, nc), (self.rect.x+10, self.rect.y+14))
+        # Truncate long names
+        name = self.name if len(self.name) <= 20 else self.name[:18] + "…"
+        s.blit(fonts['mid'].render(name, True, tc), (self.rect.x+42, self.rect.y+13))
 
 
-class SmallButton:
-    def __init__(self, x, y, w, h, label):
-        self.rect  = pygame.Rect(x, y, w, h)
-        self.label = label
+class SmBtn:
+    def __init__(self, x, y, w, h, lbl):
+        self.rect = pygame.Rect(x, y, w, h); self.label = lbl
+    def draw(self, s, fonts, act=False, hov=False):
+        bg = UI_ACCENT if act else (UI_HOVER if hov else UI_PANEL2)
+        fc = (0, 0, 0) if act else UI_TEXT
+        pygame.draw.rect(s, bg,        self.rect, border_radius=5)
+        pygame.draw.rect(s, UI_BORDER, self.rect, 1, border_radius=5)
+        t = fonts['small'].render(self.label, True, fc)
+        s.blit(t, t.get_rect(center=self.rect.center))
 
-    def draw(self, screen, fonts, active=False, hovered=False):
-        bg  = UI_ACCENT if active else (UI_HOVER if hovered else UI_PANEL2)
-        col = (0, 0, 0)  if active else UI_TEXT
-        pygame.draw.rect(screen, bg,       self.rect, border_radius=5)
-        pygame.draw.rect(screen, UI_BORDER, self.rect, 1, border_radius=5)
-        surf = fonts['small'].render(self.label, True, col)
-        screen.blit(surf, surf.get_rect(center=self.rect.center))
 
 # ============================================================
 # ====================== MENU SCREEN =========================
 # ============================================================
 
-class MenuScreen:
-    PAD        = 18
-    BTN_W      = 226
-    BTN_GAP    = 6
-    COL_GAP    = 10
-    COLS       = 3
-    ROWS       = 5          # 3 * 5 = 15 exactly
+class Menu:
+    PAD = 18; BTN_W = 226; BTN_GAP = 5; COL_GAP = 10; COLS = 3
 
     def __init__(self, screen, fonts):
-        self.screen    = screen
-        self.fonts     = fonts
-        self.selected  = 0
-        self.hovered   = -1
-        self.sound_on  = ENABLE_SOUND
+        self.screen = screen; self.fonts = fonts
+        self.sel = 0; self.hov = -1; self.sound_on = ENABLE_SOUND
+        self.err_msg = ""; self.err_timer = 0
 
-        # Layout: algorithm grid on the left, settings on the right
-        grid_x = self.PAD
-        grid_y = 82
+        self._rebuild_buttons()
 
-        self.buttons = []
-        for idx, (name, key) in enumerate(ALGORITHMS):
-            col = idx % self.COLS
-            row = idx // self.COLS
-            x = grid_x + col * (self.BTN_W + self.COL_GAP)
-            y = grid_y + row * (AlgoButton.HEIGHT + self.BTN_GAP)
-            self.buttons.append(AlgoButton(x, y, self.BTN_W, name, key, idx))
-
-        # Right panel
-        rx = grid_x + self.COLS * (self.BTN_W + self.COL_GAP) + 20
-        self.right_x = rx
+        rx = self.PAD + self.COLS * (self.BTN_W + self.COL_GAP) + 20
+        self.rx = rx
         rw = WINDOW_WIDTH - rx - self.PAD
 
-        self.slider_size  = Slider(rx, 130, rw, 4,  MAX_ARRAY_SIZE, 32,  "Array Size", is_int=True)
-        self.slider_speed = Slider(rx, 200, rw, 0.25, 8.0,          1.0, "Speed")
+        self.sl_size    = Slider(rx, 105, rw, 4, MAX_ARRAY_SIZE, 32, "Array Size", is_int=True)
+        self.sl_speed   = Slider(rx, 175, rw, 0.25, 8.0, 1.0, "Speed")
+        self.sl_sustain = Slider(rx, 245, rw, 0.02, 0.40, 0.10, "Sound Sustain")
+        self.sl_freq    = FreqRangeSlider(rx, 315, rw, FREQ_LOW, FREQ_HIGH)
 
-        # Radix base selector (only shown for radix sorts)
-        self.radix_base   = 10
-        self.base_btns    = []
         bases = [2, 4, 8, 10, 16]
         bw = (rw - (len(bases)-1)*6) // len(bases)
+        self.radix_base = 10; self.base_btns = []
         for i, b in enumerate(bases):
-            bx = rx + i * (bw + 6)
-            self.base_btns.append((SmallButton(bx, 300, bw, 30, f"Base {b}"), b))
+            self.base_btns.append((SmBtn(rx+i*(bw+6), 405, bw, 28, f"Base {b}"), b))
 
-        # Sound toggle
-        self.sound_btn = SmallButton(rx, 365, rw, 34, "")
+        self.snd_btn     = SmBtn(rx, 452, rw//2 - 4, 32, "")
+        self.load_btn    = SmBtn(rx + rw//2 + 4, 452, rw//2 - 4, 32, "⚡ Load Sorter")
+        self.start_rect  = pygame.Rect(rx, WINDOW_HEIGHT-75, rw, 50)
+        self.start_hov   = False
 
-        # Start button
-        sy = WINDOW_HEIGHT - 85
-        self.start_rect    = pygame.Rect(rx, sy, rw, 52)
-        self.start_hovered = False
+    def _rebuild_buttons(self):
+        """Rebuild button list from ALGORITHMS + any loaded customs."""
+        gx, gy = self.PAD, 80
+        self.btns = []
+        all_algos = list(ALGORITHMS)
+        for key, fn in _custom_generators.items():
+            # find existing entry if already added
+            found = any(k == key for _, k in all_algos)
+            if not found:
+                # look it up in the global ALGORITHMS list (we append there on load)
+                pass
+        # Just use the global ALGORITHMS list which we mutate on load
+        for i, (nm, ky) in enumerate(ALGORITHMS):
+            col = i % self.COLS; row = i // self.COLS
+            x = gx + col*(self.BTN_W+self.COL_GAP)
+            y = gy + row*(AlgoBtn.H+self.BTN_GAP)
+            self.btns.append(AlgoBtn(x, y, self.BTN_W, nm, ky, i))
 
-    def _is_radix(self):
-        return ALGORITHMS[self.selected][1] in ("lsd_radix", "msd_radix")
+    def _radix(self):
+        key = ALGORITHMS[self.sel][1]
+        return key in ("lsd_radix", "msd_radix")
 
-    def handle_event(self, event):
-        self.slider_size.handle_event(event)
-        self.slider_speed.handle_event(event)
+    def handle(self, ev):
+        self.sl_size.handle(ev); self.sl_speed.handle(ev)
+        self.sl_sustain.handle(ev); self.sl_freq.handle(ev)
 
-        if event.type == pygame.MOUSEMOTION:
-            self.hovered      = -1
-            self.start_hovered = self.start_rect.collidepoint(event.pos)
-            for btn in self.buttons:
-                if btn.rect.collidepoint(event.pos):
-                    self.hovered = btn.index
+        if ev.type == pygame.MOUSEMOTION:
+            self.hov = -1; self.start_hov = self.start_rect.collidepoint(ev.pos)
+            for b in self.btns:
+                if b.rect.collidepoint(ev.pos): self.hov = b.idx
 
-        if event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
-            for btn in self.buttons:
-                if btn.rect.collidepoint(event.pos):
-                    self.selected = btn.index
+        if ev.type == pygame.MOUSEBUTTONDOWN and ev.button == 1:
+            for b in self.btns:
+                if b.rect.collidepoint(ev.pos): self.sel = b.idx
 
-            if self._is_radix():
+            if self._radix():
                 for sb, base in self.base_btns:
-                    if sb.rect.collidepoint(event.pos):
-                        self.radix_base = base
+                    if sb.rect.collidepoint(ev.pos): self.radix_base = base
 
-            if self.sound_btn.rect.collidepoint(event.pos):
+            if self.snd_btn.rect.collidepoint(ev.pos):
                 self.sound_on = not self.sound_on
 
-            if self.start_rect.collidepoint(event.pos):
+            if self.load_btn.rect.collidepoint(ev.pos):
+                self._do_load()
+
+            if self.start_rect.collidepoint(ev.pos):
                 return "start"
 
         return None
 
+    def _do_load(self):
+        path = open_file_dialog()
+        if not path: return
+        result, err = load_custom_sorter(path)
+        if err:
+            self.err_msg = f"Load error: {err[:60]}"
+            self.err_timer = pygame.time.get_ticks() + 4000
+            return
+        name, key = result
+        # Append to global list if not already there
+        if not any(k == key for _, k in ALGORITHMS):
+            ALGORITHMS.append((name, key))
+        # Rebuild buttons & select the new one
+        self._rebuild_buttons()
+        self.sel = len(ALGORITHMS) - 1
+        self.err_msg = f"Loaded: {name}"
+        self.err_timer = pygame.time.get_ticks() + 3000
+
     def draw(self):
-        s = self.screen
+        s = self.screen; rx = self.rx; rw = WINDOW_WIDTH - rx - self.PAD
         s.fill(UI_BG)
 
-        # ---- Title bar ----
-        title = self.fonts['title'].render("SORTING VISUALIZER", True, UI_TEXT)
-        s.blit(title, (self.PAD, 22))
-        ver = self.fonts['small'].render("15 ALGORITHMS", True, UI_SUBTEXT)
-        s.blit(ver, (self.PAD + title.get_width() + 14, 31))
+        # Title
+        t  = self.fonts['title'].render("SuperSorter", True, UI_TEXT)
+        t2 = self.fonts['title'].render("SuperSorter", True, UI_ACCENT)
+        # slight glow by drawing accent version offset
+        s.blit(t2, (self.PAD+1, 23))
+        s.blit(t,  (self.PAD,   22))
+        s.blit(self.fonts['small'].render(f"{len(ALGORITHMS)} algorithms  •  SoS audio", True, UI_SUBTEXT),
+               (self.PAD + t.get_width() + 14, 31))
+        pygame.draw.line(s, UI_BORDER, (self.PAD, 70), (WINDOW_WIDTH-self.PAD, 70), 1)
 
-        # Divider
-        pygame.draw.line(s, UI_BORDER, (self.PAD, 72), (WINDOW_WIDTH - self.PAD, 72), 1)
+        # Algorithm buttons
+        for b in self.btns: b.draw(s, self.fonts, b.idx==self.sel, b.idx==self.hov)
 
-        # ---- Algorithm buttons ----
-        for btn in self.buttons:
-            btn.draw(s, self.fonts, btn.index == self.selected, btn.index == self.hovered)
-
-        # ---- Right panel background ----
-        rx  = self.right_x
-        rw  = WINDOW_WIDTH - rx - self.PAD
-        panel = pygame.Rect(rx - 12, 80, rw + 24, WINDOW_HEIGHT - 95)
-        pygame.draw.rect(s, UI_PANEL, panel, border_radius=8)
+        # Right panel
+        panel = pygame.Rect(rx-12, 78, rw+24, WINDOW_HEIGHT-93)
+        pygame.draw.rect(s, UI_PANEL,  panel, border_radius=8)
         pygame.draw.rect(s, UI_BORDER, panel, 1, border_radius=8)
+        s.blit(self.fonts['small'].render("SETTINGS", True, UI_SUBTEXT), (rx, 90))
 
-        # Settings label
-        hdr = self.fonts['small'].render("SETTINGS", True, UI_SUBTEXT)
-        s.blit(hdr, (rx, 92))
+        self.sl_size.draw(s, self.fonts)
+        self.sl_speed.draw(s, self.fonts)
+        self.sl_sustain.draw(s, self.fonts)
+        self.sl_freq.draw(s, self.fonts)
 
-        # Sliders
-        self.slider_size.draw(s, self.fonts)
-        self.slider_speed.draw(s, self.fonts)
-
-        # Radix options
-        if self._is_radix():
-            lbl = self.fonts['small'].render("Radix Base:", True, UI_SUBTEXT)
-            s.blit(lbl, (rx, 278))
+        # Radix base
+        mp = pygame.mouse.get_pos()
+        if self._radix():
+            s.blit(self.fonts['small'].render("Radix Base:", True, UI_SUBTEXT), (rx, 392))
             for sb, base in self.base_btns:
-                sb.draw(s, self.fonts,
-                        active=self.radix_base == base,
-                        hovered=sb.rect.collidepoint(pygame.mouse.get_pos()))
+                sb.draw(s, self.fonts, self.radix_base==base, sb.rect.collidepoint(mp))
         else:
-            # Dim the radix area with a note
-            note = self.fonts['small'].render("Radix base: N/A for this algorithm", True, UI_DIM)
-            s.blit(note, (rx, 288))
+            s.blit(self.fonts['small'].render("Radix base: N/A for this algorithm", True, UI_DIM), (rx, 400))
 
-        # Sound toggle
-        sy_lbl = 352
-        lbl = self.fonts['small'].render("Sound:", True, UI_SUBTEXT)
-        s.blit(lbl, (rx, sy_lbl))
-        self.sound_btn.rect.y = sy_lbl + 20
-        self.sound_btn.label  = "ON  ♪" if self.sound_on else "OFF ✕"
-        self.sound_btn.draw(s, self.fonts,
-                            active=self.sound_on,
-                            hovered=self.sound_btn.rect.collidepoint(pygame.mouse.get_pos()))
+        # Sound + Load buttons
+        self.snd_btn.label = "♪ Sound ON" if self.sound_on else "✕ Sound OFF"
+        self.snd_btn.draw(s, self.fonts, self.sound_on, self.snd_btn.rect.collidepoint(mp))
+        self.load_btn.draw(s, self.fonts, False, self.load_btn.rect.collidepoint(mp))
 
-        # Selected algorithm info
-        name, key = ALGORITHMS[self.selected]
-        info_y = 440
-        info_lbl = self.fonts['small'].render("Selected:", True, UI_SUBTEXT)
-        info_val = self.fonts['mid'].render(name, True, UI_ACCENT)
-        s.blit(info_lbl, (rx, info_y))
-        s.blit(info_val, (rx, info_y + 18))
+        # Selected name
+        nm, ky = ALGORITHMS[self.sel]
+        s.blit(self.fonts['small'].render("Selected:", True, UI_SUBTEXT), (rx, 502))
+        s.blit(self.fonts['mid'].render(nm, True, UI_ACCENT), (rx, 518))
 
-        # START button
-        sh = self.start_hovered
-        start_col  = (240, 50, 50) if sh else (200, 35, 35)
-        border_col = (255, 90, 90) if sh else UI_ACCENT
-        pygame.draw.rect(s, start_col, self.start_rect, border_radius=8)
-        pygame.draw.rect(s, border_col, self.start_rect, 2, border_radius=8)
-        start_txt = self.fonts['big'].render("▶  START", True, (255, 255, 255))
-        s.blit(start_txt, start_txt.get_rect(center=self.start_rect.center))
+        # Error / status message
+        now = pygame.time.get_ticks()
+        if self.err_msg and now < self.err_timer:
+            is_err = self.err_msg.startswith("Load error")
+            col    = (255, 90, 90) if is_err else (90, 220, 130)
+            s.blit(self.fonts['small'].render(self.err_msg, True, col), (rx, 542))
+        elif now >= self.err_timer:
+            self.err_msg = ""
+
+        s.blit(self.fonts['small'].render("ESC during sort returns to menu", True, UI_DIM), (rx, 560))
+
+        # Start button
+        sh = self.start_hov
+        pygame.draw.rect(s, (240,50,50) if sh else (200,35,35), self.start_rect, border_radius=8)
+        pygame.draw.rect(s, (255,90,90) if sh else UI_ACCENT,   self.start_rect, 2, border_radius=8)
+        st = self.fonts['big'].render("▶  START", True, (255,255,255))
+        s.blit(st, st.get_rect(center=self.start_rect.center))
 
         pygame.display.flip()
 
-    def get_config(self):
-        name, key = ALGORITHMS[self.selected]
-        return {
-            "name":       name,
-            "key":        key,
-            "size":       self.slider_size.value,
-            "speed":      self.slider_speed.value,
-            "radix_base": self.radix_base,
-            "sound":      self.sound_on,
-        }
+    def config(self):
+        nm, ky = ALGORITHMS[self.sel]
+        return dict(
+            name=nm, key=ky,
+            size=self.sl_size.value,
+            speed=self.sl_speed.value,
+            sustain=self.sl_sustain.value,
+            freq_lo=self.sl_freq.lo_val,
+            freq_hi=self.sl_freq.hi_val,
+            radix_base=self.radix_base,
+            sound=self.sound_on,
+        )
 
 # ============================================================
-# ========================= MAIN LOOP ========================
+# ========================= MAIN =============================
 # ============================================================
 
-def force_window_on_top(screen):
+def force_top():
     if HAS_CTYPES and sys.platform == "win32":
         try:
             hwnd = pygame.display.get_wm_info()['window']
-            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001 | 0x0002)
-        except Exception:
-            pass
+            ctypes.windll.user32.SetWindowPos(hwnd, -1, 0, 0, 0, 0, 0x0001|0x0002)
+        except Exception: pass
 
 def build_fonts():
-    def try_font(names, size):
+    def tf(names, sz):
         for n in names:
-            try:
-                f = pygame.font.SysFont(n, size)
-                return f
-            except Exception:
-                pass
-        return pygame.font.SysFont(None, size)
+            try: return pygame.font.SysFont(n, sz)
+            except: pass
+        return pygame.font.SysFont(None, sz)
+    mono = ["Consolas", "Courier New", "Lucida Console"]
+    sans = ["Segoe UI", "Helvetica Neue", "Arial"]
+    return dict(title=tf(mono, 26), big=tf(sans, 24), mid=tf(sans, 18),
+                small=tf(sans, 14), mono_sm=tf(mono, 13))
 
-    mono_candidates = ["Consolas", "Courier New", "Lucida Console", "monospace"]
-    sans_candidates = ["Segoe UI", "Helvetica Neue", "Arial", "sans-serif"]
+def run_sort(screen, fonts, cfg):
+    global ENABLE_SOUND, FREQ_LOW, FREQ_HIGH
+    ENABLE_SOUND = cfg["sound"]
+    FREQ_LOW     = cfg["freq_lo"]
+    FREQ_HIGH    = cfg["freq_hi"]
+    if _engine: _engine.set_sustain(cfg["sustain"])
 
-    return {
-        "title":   try_font(mono_candidates, 26),
-        "big":     try_font(sans_candidates, 24),
-        "mid":     try_font(sans_candidates, 18),
-        "small":   try_font(sans_candidates, 14),
-        "mono_sm": try_font(mono_candidates, 13),
-    }
-
-def run_sort(screen, fonts, config):
-    global ENABLE_SOUND
-    ENABLE_SOUND = config["sound"]
-
-    arr       = list(range(1, config["size"] + 1))
-    random.shuffle(arr)
-
-    gen   = get_sort_generator(config["key"], arr, config["radix_base"])
-    clock = pygame.time.Clock()
-    label = config["name"]
+    arr = list(range(1, cfg["size"]+1)); random.shuffle(arr)
+    gen = get_generator(cfg["key"], arr, cfg["radix_base"])
+    clock = pygame.time.Clock(); label = cfg["name"]
 
     while True:
-        clock.tick(FPS * config["speed"])
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                return  # back to menu
-
+        clock.tick(FPS * cfg["speed"])
+        for ev in pygame.event.get():
+            if ev.type == pygame.QUIT: stop_sound(); pygame.quit(); sys.exit()
+            if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE: return
         try:
-            arr_state, active = next(gen)
-            draw_bars(screen, arr_state, active, label)
+            state, active = next(gen)
+            draw_bars(screen, state, active, label)
             if active and ENABLE_SOUND:
-                play_tone(arr_state[active[0]], config["size"])
+                trigger_tone(state[active[0]], cfg["size"])
         except StopIteration:
-            draw_bars(screen, arr, [], label + "  ✓ SORTED")
-            pygame.time.wait(1600)
-            return
+            draw_bars(screen, arr, [], label + "  ✓  SORTED")
+            pygame.time.wait(1800); return
 
 def main():
-    pygame.init()
-    pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=512)
-
+    pygame.init(); init_sound()
     screen = pygame.display.set_mode((WINDOW_WIDTH, WINDOW_HEIGHT))
-    pygame.display.set_caption("Sorting Visualizer")
-    force_window_on_top(screen)
-
-    fonts = build_fonts()
-    menu  = MenuScreen(screen, fonts)
-
-    clock = pygame.time.Clock()
+    pygame.display.set_caption("SuperSorter")
+    force_top()
+    fonts = build_fonts(); clock = pygame.time.Clock()
 
     while True:
-        clock.tick(60)
-        for event in pygame.event.get():
-            if event.type == pygame.QUIT:
-                pygame.quit(); sys.exit()
-            if event.type == pygame.KEYDOWN and event.key == pygame.K_ESCAPE:
-                pygame.quit(); sys.exit()
-
-            result = menu.handle_event(event)
-            if result == "start":
-                config = menu.get_config()
-                run_sort(screen, fonts, config)
-                # After sorting, redraw menu
-                menu = MenuScreen(screen, fonts)
-
-        menu.draw()
+        menu = Menu(screen, fonts)
+        while True:
+            clock.tick(60)
+            for ev in pygame.event.get():
+                if ev.type == pygame.QUIT: stop_sound(); pygame.quit(); sys.exit()
+                if ev.type == pygame.KEYDOWN and ev.key == pygame.K_ESCAPE:
+                    stop_sound(); pygame.quit(); sys.exit()
+                if menu.handle(ev) == "start":
+                    run_sort(screen, fonts, menu.config()); break
+            else:
+                menu.draw(); continue
+            break
 
 if __name__ == "__main__":
     main()
